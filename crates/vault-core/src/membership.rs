@@ -105,6 +105,14 @@ impl MembershipStore {
         Self::default()
     }
 
+    pub fn from_members(members: Vec<VaultMember>) -> Result<Self> {
+        let mut store = Self::new();
+        for member in members {
+            store.insert_member(member)?;
+        }
+        Ok(store)
+    }
+
     pub fn insert_member(&mut self, member: VaultMember) -> Result<()> {
         validate_public_key(&member.public_key)?;
         if self.members.contains_key(&member.member_id) {
@@ -202,6 +210,12 @@ impl MembershipStore {
 
     pub fn find_member(&self, member_id: Uuid) -> Option<&VaultMember> {
         self.members.get(&member_id)
+    }
+
+    pub fn find_by_device_id(&self, device_id: DeviceId) -> Option<&VaultMember> {
+        self.members
+            .values()
+            .find(|member| member.device_id == device_id)
     }
 
     pub fn authorize(&self, member: &VaultMember, operation: MembershipOperation) -> Result<()> {

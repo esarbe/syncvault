@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod membership;
 pub mod persistence;
 pub mod record;
+pub mod service;
 pub mod sync;
 pub mod vault;
 pub mod version_vector;
@@ -35,7 +36,10 @@ pub use membership::{
 pub use persistence::{
     PersistedEventIndexEntry, PersistenceError, VaultPersistence, VaultSnapshot,
 };
-pub use record::{EncryptedRecord, RecordData, RecordError, RecordId, RecordStore, RecordType};
+pub use record::{
+    EncryptedRecord, RecordData, RecordError, RecordId, RecordStore, RecordType, RecordView,
+};
+pub use service::{VaultService, VaultServiceError};
 pub use sync::{
     EventAck, EventInventory, EventRange, EventReject, EventTransfer, EventTransferError,
     EventTransferResult, MissingEventsRequest, RecordComparison, RecordDifference, RecordSummary,

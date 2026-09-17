@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use ed25519_dalek::VerifyingKey;
 
 use crate::event::{Event, EventError, EventId};
+use crate::membership::MembershipStore;
 use crate::record::RecordId;
 use crate::version_vector::VersionVector;
 use syncthing_core::DeviceId;
@@ -23,11 +24,15 @@ pub enum HistoryError {
     },
     #[error("event causal version is ahead of known history")]
     CausalityViolation,
+    #[error("event author is not a vault member: {0}")]
+    UnknownAuthor(DeviceId),
+    #[error("event author public key is invalid: {0}")]
+    InvalidPublicKey(DeviceId),
 }
 
 pub type Result<T> = std::result::Result<T, HistoryError>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct EventHistory {
     events: BTreeMap<EventId, Event>,
     order: Vec<EventId>,
@@ -39,6 +44,25 @@ pub struct EventHistory {
 impl EventHistory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_events(events: Vec<Event>, members: &MembershipStore) -> Result<Self> {
+        let mut history = Self::new();
+        for event in events {
+            let author = event.author();
+            let member = members
+                .find_by_device_id(author)
+                .ok_or(HistoryError::UnknownAuthor(author))?;
+            let public_key: [u8; 32] = member
+                .public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| HistoryError::InvalidPublicKey(author))?;
+            let verifying_key = VerifyingKey::from_bytes(&public_key)
+                .map_err(|_| HistoryError::InvalidPublicKey(author))?;
+            history.append(event, &verifying_key)?;
+        }
+        Ok(history)
     }
 
     pub fn append(&mut self, event: Event, verifying_key: &VerifyingKey) -> Result<()> {
@@ -125,6 +149,10 @@ impl EventHistory {
         self.order
             .iter()
             .filter_map(|event_id| self.events.get(event_id))
+    }
+
+    pub fn device_sequence(&self, device_id: DeviceId) -> u64 {
+        self.device_sequences.get(&device_id).copied().unwrap_or(0)
     }
 }
 

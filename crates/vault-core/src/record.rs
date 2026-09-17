@@ -36,6 +36,14 @@ pub struct RecordData {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordView {
+    pub id: RecordId,
+    pub record_type: RecordType,
+    pub payload: Vec<u8>,
+    pub deleted: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RecordError {
     #[error("record not found: {0}")]
@@ -52,6 +60,7 @@ pub enum RecordError {
 
 pub type Result<T> = std::result::Result<T, RecordError>;
 
+#[derive(Clone)]
 pub struct RecordStore {
     keys: VaultKeys,
     records: BTreeMap<RecordId, EncryptedRecord>,
@@ -63,6 +72,18 @@ impl RecordStore {
             keys,
             records: BTreeMap::new(),
         }
+    }
+
+    pub fn from_records(keys: VaultKeys, records: Vec<EncryptedRecord>) -> Result<Self> {
+        let mut store = Self::new(keys);
+        for record in records {
+            if store.records.contains_key(&record.id) {
+                return Err(RecordError::AlreadyExists(record.id));
+            }
+            store.validate_ciphertext(record.id, &record.ciphertext)?;
+            store.records.insert(record.id, record);
+        }
+        Ok(store)
     }
 
     pub fn create_record(&mut self, record_type: RecordType, payload: Vec<u8>) -> Result<RecordId> {
@@ -163,6 +184,19 @@ impl RecordStore {
         Ok(Some(self.decrypt_record(record)?))
     }
 
+    pub fn get_record_including_tombstone(&self, id: RecordId) -> Result<Option<RecordView>> {
+        let Some(record) = self.records.get(&id) else {
+            return Ok(None);
+        };
+        let data = self.decrypt_record(record)?;
+        Ok(Some(RecordView {
+            id: data.id,
+            record_type: data.record_type,
+            payload: data.payload,
+            deleted: record.deleted,
+        }))
+    }
+
     pub fn list_records(&self) -> Result<Vec<RecordData>> {
         self.records
             .values()
@@ -173,6 +207,14 @@ impl RecordStore {
 
     pub fn encrypted_records(&self) -> impl Iterator<Item = &EncryptedRecord> {
         self.records.values()
+    }
+
+    pub fn encrypted_record(&self, id: RecordId) -> Option<&EncryptedRecord> {
+        self.records.get(&id)
+    }
+
+    pub(crate) fn encrypt_payload(&self, id: RecordId, payload: &[u8]) -> Result<Vec<u8>> {
+        self.encrypt(id, payload)
     }
 
     fn encrypt(&self, id: RecordId, payload: &[u8]) -> Result<Vec<u8>> {

@@ -78,6 +78,8 @@ pub struct UnlockedVault {
     metadata: VaultMetadata,
     keys: VaultKeys,
     signing_key: SigningKey,
+    snapshot: VaultSnapshot,
+    persistence: VaultPersistence,
 }
 
 impl UnlockedVault {
@@ -95,6 +97,24 @@ impl UnlockedVault {
 
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VaultRegistryEntry,
+        VaultKeys,
+        SigningKey,
+        VaultSnapshot,
+        VaultPersistence,
+    ) {
+        (
+            self.entry,
+            self.keys,
+            self.signing_key,
+            self.snapshot,
+            self.persistence,
+        )
     }
 }
 
@@ -197,6 +217,8 @@ impl VaultRegistry {
             entry,
             keys,
             signing_key,
+            snapshot,
+            persistence,
         })
     }
 
@@ -210,6 +232,7 @@ impl VaultRegistry {
 
     pub fn unlock_vault(&self, name: &str, password: &VaultPassword) -> Result<UnlockedVault> {
         let (entry, snapshot) = self.load_named_snapshot(name)?;
+        let persistence = VaultPersistence::new(self.resolve_storage_path(&entry)?);
         let hierarchy = EncryptedKeyHierarchy {
             encrypted_vault_key: snapshot.header.encrypted_vault_key.clone(),
             encrypted_history_key: snapshot.header.encrypted_history_key.clone(),
@@ -231,6 +254,8 @@ impl VaultRegistry {
             entry,
             keys,
             signing_key,
+            snapshot,
+            persistence,
         })
     }
 
@@ -322,6 +347,7 @@ fn empty_snapshot(
         events: Vec::new(),
         version_vector: VersionVector::new(),
         members: vec![owner],
+        membership_changes: Vec::new(),
         conflicts: Vec::new(),
         event_index: Vec::new(),
         sync_state: Vec::new(),

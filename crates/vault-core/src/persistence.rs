@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::conflict::Conflict;
 use crate::event::{Event, EventId};
-use crate::membership::VaultMember;
+use crate::membership::{MembershipChange, VaultMember};
 use crate::record::EncryptedRecord;
 use crate::vault::VaultHeader;
 use crate::version_vector::VersionVector;
@@ -30,6 +30,8 @@ pub struct VaultSnapshot {
     pub events: Vec<Event>,
     pub version_vector: VersionVector,
     pub members: Vec<VaultMember>,
+    #[serde(default)]
+    pub membership_changes: Vec<MembershipChange>,
     pub conflicts: Vec<Conflict>,
     pub event_index: Vec<PersistedEventIndexEntry>,
     pub sync_state: Vec<u8>,
@@ -129,6 +131,7 @@ mod tests {
             events: Vec::new(),
             version_vector: VersionVector::new(),
             members: Vec::new(),
+            membership_changes: Vec::new(),
             conflicts: Vec::new(),
             event_index: Vec::new(),
             sync_state: b"last-sync-token".to_vec(),
@@ -161,6 +164,7 @@ mod tests {
             events: Vec::new(),
             version_vector: VersionVector::new(),
             members: Vec::new(),
+            membership_changes: Vec::new(),
             conflicts: Vec::new(),
             event_index: Vec::new(),
             sync_state: Vec::new(),

@@ -557,6 +557,9 @@ step 25 CLI support utilities.
 
 ## 22. Implement operational state reconstruction and vault service
 
+**Status: implemented** in `vault-core::service` and validated store
+constructors.
+
 Add import/reconstruction APIs for:
 
     RecordStore
@@ -583,6 +586,11 @@ Every mutating operation must:
 
 Add lookups required by callers, including device ID to member ID, record name
 to record ID, and access to tombstoned records for restore operations.
+
+Device and tombstone lookups are implemented. Record-name lookup is completed
+in step 23 after the versioned plaintext record document defines name parsing
+and duplicate-name behavior; names cannot be inferred safely from opaque
+ciphertext.
 
 The CLI and protocol handlers must call this facade instead of composing
 low-level stores directly.

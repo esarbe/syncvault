@@ -37,13 +37,17 @@ pub enum ConflictError {
     NotFound(ConflictId),
     #[error("conflict is already resolved")]
     AlreadyResolved,
+    #[error("conflict already exists: {0}")]
+    AlreadyExists(ConflictId),
+    #[error("persisted conflict is invalid: {0}")]
+    InvalidPersisted(String),
     #[error("event error: {0}")]
     Event(#[from] EventError),
 }
 
 pub type Result<T> = std::result::Result<T, ConflictError>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ConflictStore {
     conflicts: BTreeMap<ConflictId, Conflict>,
 }
@@ -51,6 +55,55 @@ pub struct ConflictStore {
 impl ConflictStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_conflicts(
+        conflicts: Vec<Conflict>,
+        history: &crate::history::EventHistory,
+    ) -> Result<Self> {
+        let mut store = Self::new();
+        for conflict in conflicts {
+            if store.conflicts.contains_key(&conflict.conflict_id) {
+                return Err(ConflictError::AlreadyExists(conflict.conflict_id));
+            }
+            if conflict.branches.len() < 2
+                || conflict
+                    .branches
+                    .iter()
+                    .any(|branch| branch.record_id() != conflict.record_id)
+            {
+                return Err(ConflictError::InvalidPersisted(
+                    "branches must describe one record".to_string(),
+                ));
+            }
+            for branch in &conflict.branches {
+                if history.get(branch.event_id()) != Some(branch) {
+                    return Err(ConflictError::InvalidPersisted(
+                        "branch is absent from history".to_string(),
+                    ));
+                }
+            }
+            if !conflict.branches.iter().enumerate().all(|(index, branch)| {
+                conflict.branches.iter().skip(index + 1).all(|other| {
+                    branch.causal_version().compare(other.causal_version())
+                        == VersionOrdering::Concurrent
+                })
+            }) {
+                return Err(ConflictError::InvalidPersisted(
+                    "branches are not concurrent".to_string(),
+                ));
+            }
+            if conflict
+                .resolution_event_id
+                .is_some_and(|event_id| history.get(event_id).is_none())
+            {
+                return Err(ConflictError::InvalidPersisted(
+                    "resolution event is absent from history".to_string(),
+                ));
+            }
+            store.conflicts.insert(conflict.conflict_id, conflict);
+        }
+        Ok(store)
     }
 
     pub fn detect(&mut self, left: Event, right: Event) -> Result<ConflictId> {
