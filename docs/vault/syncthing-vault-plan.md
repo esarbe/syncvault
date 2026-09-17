@@ -523,7 +523,147 @@ The protocol layer converts network messages into vault-core operations.
 
 ---
 
-## 21. Add CLI operations
+## 21. Implement vault registry and unlock lifecycle
+
+Add a durable vault registry that maps a user-facing vault name to:
+
+    vault_id
+    storage path
+    local member_id
+    configured peers
+
+Persist the complete `VaultHeader`, including the encrypted key hierarchy needed
+to unlock the vault. Do not persist only redacted `VaultMetadata`.
+
+Implement:
+
+    create_vault(name, password)
+    list_vaults()
+    open_vault(name)
+    unlock_vault(name, password)
+
+Vault creation must generate KDF parameters, initialize the owner membership,
+and securely persist the local signing identity. Reject duplicate or invalid
+vault names.
+
+Passwords must be supplied through a secret-input abstraction and must never be
+accepted from an insecure default command-line argument or written to logs.
+
+---
+
+## 22. Implement operational state reconstruction and vault service
+
+Add import/reconstruction APIs for:
+
+    RecordStore
+    EventHistory
+    MembershipStore
+    ConflictStore
+    version vectors
+    event indexes
+    sync state
+
+Create a `VaultService` or equivalent application facade above these stores.
+It owns an unlocked vault and exposes authorized operations for records,
+history, membership, conflicts, and synchronization.
+
+Every mutating operation must:
+
+    authorize
+      ↓
+    encrypt and sign an immutable event
+      ↓
+    update history and derived state
+      ↓
+    persist atomically
+
+Add lookups required by callers, including device ID to member ID, record name
+to record ID, and access to tombstoned records for restore operations.
+
+The CLI and protocol handlers must call this facade instead of composing
+low-level stores directly.
+
+---
+
+## 23. Define record and conflict presentation semantics
+
+Define a versioned plaintext record document inside the encrypted payload. It
+must support:
+
+    record name
+    record type
+    value
+    named fields
+
+Implement validation and serialization for each supported record type while
+keeping the synchronization protocol payload opaque.
+
+Define deterministic record-name lookup behavior, including duplicate-name
+handling and whether commands may accept a `RecordId` to disambiguate.
+
+Define conflict display and resolution inputs. Resolution must explicitly
+select a branch or provide a merged record value before creating the signed
+resolution event.
+
+---
+
+## 24. Complete vault protocol dispatch and sync orchestration
+
+Extend the authenticated vault session beyond `AUTH_REQUEST` and
+`AUTH_RESPONSE`.
+
+Implement typed request/response handling for:
+
+    VAULT_LIST
+    VAULT_INFO
+    SYNC_SUMMARY
+    SYNC_INVENTORY
+    SYNC_REQUEST
+    SYNC_EVENTS
+    SYNC_COMPLETE
+    EVENT_ACK
+    EVENT_REJECT
+    CONFLICT_LIST
+    CONFLICT_RESOLVE
+    DEVICE_ADD
+    DEVICE_REVOKE
+    KEY_ROTATE
+    ERROR
+    GOODBYE
+
+Route incoming messages through `VaultService`, enforce authorization for each
+operation, and bound all decoded collections and payloads.
+
+Add client-side synchronization orchestration and a server-side vault listener.
+Peer selection must resolve a configured device and address from the vault
+registry or require them explicitly.
+
+---
+
+## 25. Define the CLI contract and support utilities
+
+Use the command hierarchy:
+
+    vault info
+    vault list
+    vault create <name>
+    vault <name> ...
+
+Define all required inputs before wiring handlers:
+
+- `add-device`: device ID, public key, role, and key-enrollment material
+- `revoke-device`: device ID resolved to a member ID
+- `record update`: replacement value and/or repeated field updates
+- `conflicts resolve`: selected branch or merged value
+- `sync`: configured peer or explicit device ID and address
+
+Add reusable support for secure password prompts, `$EDITOR` integration through
+a permission-restricted temporary file, confirmation prompts, structured JSON
+output, secret redaction, and stable process exit codes.
+
+---
+
+## 26. Add CLI operations
 
 Extend the existing binary with commands similar to:
 
@@ -555,7 +695,7 @@ Keep CLI code thin.
 
 ---
 
-## 22. Test in layers
+## 27. Test in layers
 
 ### Crypto
 
@@ -606,7 +746,7 @@ Keep CLI code thin.
 
 ---
 
-## 23. Two-device end-to-end test
+## 28. Two-device end-to-end test
 
 Start:
 
@@ -648,7 +788,7 @@ Reconnect:
 
 ---
 
-## 24. Security review before release
+## 29. Security review before release
 
 Verify explicitly:
 
@@ -668,7 +808,7 @@ Verify explicitly:
 
 ---
 
-## 25. Final implementation order
+## 30. Final implementation order
 
 Implement in this order:
 
@@ -689,10 +829,17 @@ Implement in this order:
 15. device enrollment
 16. device revocation
 17. key rotation
-18. persistence/recovery testing
-19. CLI integration
-20. two-device end-to-end tests
-21. security review
+18. persistence and complete encrypted header storage
+19. vault registry and unlock lifecycle
+20. operational state reconstruction
+21. transactional vault service
+22. record and conflict presentation semantics
+23. vault protocol dispatch and sync orchestration
+24. CLI contract and support utilities
+25. CLI integration
+26. persistence/recovery testing
+27. two-device end-to-end tests
+28. security review
 
 The critical dependency chain is:
 
