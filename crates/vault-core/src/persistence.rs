@@ -10,7 +10,7 @@ use crate::conflict::Conflict;
 use crate::event::{Event, EventId};
 use crate::membership::VaultMember;
 use crate::record::EncryptedRecord;
-use crate::vault::VaultMetadata;
+use crate::vault::VaultHeader;
 use crate::version_vector::VersionVector;
 use syncthing_core::DeviceId;
 
@@ -24,7 +24,8 @@ pub struct PersistedEventIndexEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultSnapshot {
-    pub metadata: VaultMetadata,
+    pub header: VaultHeader,
+    pub encrypted_signing_key: Vec<u8>,
     pub records: Vec<EncryptedRecord>,
     pub events: Vec<Event>,
     pub version_vector: VersionVector,
@@ -62,9 +63,11 @@ impl VaultPersistence {
         let bytes = serde_json::to_vec_pretty(snapshot)?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
+            set_private_directory_permissions(parent)?;
         }
         let temporary_path = self.path.with_extension(format!("tmp-{}", Uuid::new_v4()));
         fs::write(&temporary_path, bytes)?;
+        set_private_permissions(&temporary_path)?;
         if let Err(error) = fs::rename(&temporary_path, &self.path) {
             let _ = fs::remove_file(&temporary_path);
             return Err(PersistenceError::Io(error));
@@ -78,6 +81,30 @@ impl VaultPersistence {
     }
 }
 
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,12 +115,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let persistence = VaultPersistence::new(directory.path().join("vault.json"));
         let snapshot = VaultSnapshot {
-            metadata: VaultMetadata {
+            header: VaultHeader {
                 vault_id: VaultId::new_v4(),
                 protocol_version: 1,
                 kdf: KdfParameters::argon2id(vec![1; 16], 19 * 1024, 2, 1),
+                encrypted_vault_key: vec![2; 48],
+                encrypted_history_key: vec![3; 48],
+                key_check: vec![4; 48],
                 members: Vec::new(),
             },
+            encrypted_signing_key: vec![5; 72],
             records: Vec::new(),
             events: Vec::new(),
             version_vector: VersionVector::new(),
@@ -106,6 +137,42 @@ mod tests {
         persistence.save(&snapshot).unwrap();
         assert_eq!(persistence.load().unwrap(), snapshot);
         assert!(persistence.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let persistence = VaultPersistence::new(directory.path().join("vault.json"));
+        let snapshot = VaultSnapshot {
+            header: VaultHeader {
+                vault_id: VaultId::new_v4(),
+                protocol_version: 1,
+                kdf: KdfParameters::argon2id(vec![1; 16], 19 * 1024, 2, 1),
+                encrypted_vault_key: vec![2; 48],
+                encrypted_history_key: vec![3; 48],
+                key_check: vec![4; 48],
+                members: Vec::new(),
+            },
+            encrypted_signing_key: vec![5; 72],
+            records: Vec::new(),
+            events: Vec::new(),
+            version_vector: VersionVector::new(),
+            members: Vec::new(),
+            conflicts: Vec::new(),
+            event_index: Vec::new(),
+            sync_state: Vec::new(),
+        };
+
+        persistence.save(&snapshot).unwrap();
+        let mode = fs::metadata(persistence.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

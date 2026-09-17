@@ -9,6 +9,7 @@ pub mod conflict;
 pub mod event;
 pub mod history;
 pub mod keys;
+pub mod lifecycle;
 pub mod membership;
 pub mod persistence;
 pub mod record;
@@ -22,6 +23,10 @@ pub use event::{Event, EventError, EventId, EventType, RecordMutation};
 pub use history::{EventHistory, HistoryError};
 pub use keys::{
     derive_master_key, EncryptedKeyHierarchy, KeyError, KeyRotation, VaultKeyRing, VaultKeys,
+};
+pub use lifecycle::{
+    OpenedVault, UnlockedVault, VaultLifecycleError, VaultPassword, VaultPeer, VaultRegistry,
+    VaultRegistryEntry,
 };
 pub use membership::{
     DeviceEnrollment, MemberRole, MembershipChange, MembershipChangeType, MembershipError,

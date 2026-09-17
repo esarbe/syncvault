@@ -66,7 +66,9 @@ enum Command {
 enum VaultCommand {
     Info,
     List,
-    Create { name: String },
+    Create {
+        name: String,
+    },
     Devices {
         #[command(subcommand)]
         command: DeviceCommand,
@@ -82,16 +84,27 @@ enum DeviceCommand {
 #[derive(Subcommand, Debug)]
 enum RecordCommand {
     List,
-    Create { record_type: String, name: String },
-    Get { name: String },
+    Create {
+        record_type: String,
+        name: String,
+    },
+    Get {
+        name: String,
+    },
     Update {
         name: String,
         #[arg(short = 'f', long = "field", value_names = ["FIELD", "VALUE"], num_args = 2)]
         fields: Vec<String>,
     },
-    Edit { name: String },
-    Delete { name: String },
-    Restore { name: String },
+    Edit {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+    Restore {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,7 +140,9 @@ async fn main() -> Result<()> {
         }
         Command::History { vault, record } => service_required(&format!(
             "history command for vault '{vault}'{}",
-            record.map(|record| format!(" and record '{record}'")).unwrap_or_default()
+            record
+                .map(|record| format!(" and record '{record}'"))
+                .unwrap_or_default()
         )),
         Command::Conflicts { vault, command } => service_required(&format!(
             "conflict command for vault '{vault}' ({command:?})"
@@ -145,9 +160,9 @@ fn handle_vault_command(tls_config: &SyncthingTlsConfig, command: VaultCommand) 
         }
         VaultCommand::List => service_required("vault list"),
         VaultCommand::Create { name } => service_required(&format!("vault create '{name}'")),
-        VaultCommand::Devices { command } => service_required(&format!(
-            "vault devices ({command:?})"
-        )),
+        VaultCommand::Devices { command } => {
+            service_required(&format!("vault devices ({command:?})"))
+        }
     }
 }
 

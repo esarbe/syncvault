@@ -525,6 +525,8 @@ The protocol layer converts network messages into vault-core operations.
 
 ## 21. Implement vault registry and unlock lifecycle
 
+**Status: implemented** in `vault-core::lifecycle`.
+
 Add a durable vault registry that maps a user-facing vault name to:
 
     vault_id
@@ -548,6 +550,8 @@ vault names.
 
 Passwords must be supplied through a secret-input abstraction and must never be
 accepted from an insecure default command-line argument or written to logs.
+`VaultPassword` zeroizes its backing buffer; terminal prompting remains part of
+step 25 CLI support utilities.
 
 ---
 
