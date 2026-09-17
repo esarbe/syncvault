@@ -11,6 +11,7 @@ members = [
     "crates/syncthing-test-utils",
     "crates/syncthing-versioner",
     "crates/bep-protocol",
+    "crates/custom-protocol",
     "crates/obsidian-vault-crypto-adapter",
     "cmd/syncthing",
     "cmd/syncthing-mcp-bridge",
@@ -55,7 +56,7 @@ base64 = "0.21"
 # 工具
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = { version = "1.6", features = ["v4"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1.5"
 dashmap = "5.5"

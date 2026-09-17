@@ -1,0 +1,15 @@
+[package]
+name = "custom-protocol"
+version.workspace = true
+edition = "2021"
+
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+syncthing-core = { path = "../syncthing-core" }
