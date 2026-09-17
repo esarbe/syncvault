@@ -39,6 +39,65 @@ enum Command {
         #[arg(long, default_value = "text")]
         payload_type: String,
     },
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
+    Record {
+        vault: String,
+        #[command(subcommand)]
+        command: RecordCommand,
+    },
+    History {
+        vault: String,
+        record: Option<String>,
+    },
+    Conflicts {
+        vault: String,
+        #[command(subcommand)]
+        command: ConflictCommand,
+    },
+    Sync {
+        vault: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultCommand {
+    Info,
+    List,
+    Create { name: String },
+    Devices {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeviceCommand {
+    Add,
+    Revoke { device_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum RecordCommand {
+    List,
+    Create { record_type: String, name: String },
+    Get { name: String },
+    Update {
+        name: String,
+        #[arg(short = 'f', long = "field", value_names = ["FIELD", "VALUE"], num_args = 2)]
+        fields: Vec<String>,
+    },
+    Edit { name: String },
+    Delete { name: String },
+    Restore { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConflictCommand {
+    Show,
+    Resolve { conflict_id: String },
 }
 
 #[tokio::main]
@@ -62,7 +121,40 @@ async fn main() -> Result<()> {
             println!("payload acknowledged by {peer_id}: {}", ack.message_id);
             Ok(())
         }
+        Command::Vault { command } => handle_vault_command(&tls_config, command),
+        Command::Record { vault, command } => {
+            service_required(&format!("record command for vault '{vault}' ({command:?})"))
+        }
+        Command::History { vault, record } => service_required(&format!(
+            "history command for vault '{vault}'{}",
+            record.map(|record| format!(" and record '{record}'")).unwrap_or_default()
+        )),
+        Command::Conflicts { vault, command } => service_required(&format!(
+            "conflict command for vault '{vault}' ({command:?})"
+        )),
+        Command::Sync { vault } => service_required(&format!("sync command for vault '{vault}'")),
     }
+}
+
+fn handle_vault_command(tls_config: &SyncthingTlsConfig, command: VaultCommand) -> Result<()> {
+    match command {
+        VaultCommand::Info => {
+            println!("device_id: {}", tls_config.device_id());
+            println!("protocol: st-vault/1");
+            Ok(())
+        }
+        VaultCommand::List => service_required("vault list"),
+        VaultCommand::Create { name } => service_required(&format!("vault create '{name}'")),
+        VaultCommand::Devices { command } => service_required(&format!(
+            "vault devices ({command:?})"
+        )),
+    }
+}
+
+fn service_required(operation: &str) -> Result<()> {
+    anyhow::bail!(
+        "{operation} requires the vault service; the CLI command surface is ready, but no vault is unlocked"
+    )
 }
 
 async fn listen_for_connections(
