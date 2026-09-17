@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::event::{Event, EventType};
 use crate::keys::{KeyError, VaultKeys};
 
 pub type RecordId = Uuid;
@@ -43,6 +44,8 @@ pub enum RecordError {
     AlreadyExists(RecordId),
     #[error("record is deleted: {0}")]
     Deleted(RecordId),
+    #[error("record mutation payload is invalid: {0}")]
+    InvalidMutation(String),
     #[error("record cryptography failed: {0}")]
     Crypto(#[from] KeyError),
 }
@@ -105,6 +108,51 @@ impl RecordStore {
         Ok(())
     }
 
+    pub fn apply_event(&mut self, event: &Event, record_type: RecordType) -> Result<()> {
+        let id = event.record_id();
+        match event.mutation().event_type() {
+            EventType::Create => {
+                if self.records.contains_key(&id) {
+                    return Err(RecordError::AlreadyExists(id));
+                }
+                self.validate_ciphertext(id, event.mutation().encrypted_payload())?;
+                self.records.insert(
+                    id,
+                    EncryptedRecord {
+                        id,
+                        record_type,
+                        ciphertext: event.mutation().encrypted_payload().to_vec(),
+                        deleted: false,
+                    },
+                );
+            }
+            EventType::Update => {
+                self.validate_ciphertext(id, event.mutation().encrypted_payload())?;
+                let record = self.records.get_mut(&id).ok_or(RecordError::NotFound(id))?;
+                if record.deleted {
+                    return Err(RecordError::Deleted(id));
+                }
+                record.ciphertext = event.mutation().encrypted_payload().to_vec();
+            }
+            EventType::Delete => {
+                let record = self.records.get_mut(&id).ok_or(RecordError::NotFound(id))?;
+                record.deleted = true;
+            }
+            EventType::Restore => {
+                let record = self.records.get_mut(&id).ok_or(RecordError::NotFound(id))?;
+                if !record.deleted {
+                    return Ok(());
+                }
+                record.deleted = false;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_tombstone(&self, id: RecordId) -> bool {
+        self.records.get(&id).is_some_and(|record| record.deleted)
+    }
+
     pub fn get_record(&self, id: RecordId) -> Result<Option<RecordData>> {
         let Some(record) = self.records.get(&id) else {
             return Ok(None);
@@ -140,6 +188,13 @@ impl RecordStore {
                 .decrypt(&record.ciphertext, &associated_data(record.id))?,
         })
     }
+
+    fn validate_ciphertext(&self, id: RecordId, ciphertext: &[u8]) -> Result<()> {
+        self.keys
+            .decrypt(ciphertext, &associated_data(id))
+            .map(|_| ())
+            .map_err(|error| RecordError::InvalidMutation(error.to_string()))
+    }
 }
 
 fn associated_data(id: RecordId) -> Vec<u8> {
@@ -151,6 +206,7 @@ fn associated_data(id: RecordId) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::RecordMutation;
     use crate::vault::KdfParameters;
 
     fn store() -> RecordStore {
@@ -199,5 +255,59 @@ mod tests {
         let record = store.records.get_mut(&id).unwrap();
         record.id = RecordId::new_v4();
         assert!(matches!(store.get_record(id), Err(RecordError::Crypto(_))));
+    }
+
+    #[test]
+    fn delete_event_creates_persistent_tombstone_until_restore_event() {
+        let (keys, _) = VaultKeys::create(
+            b"test-password",
+            &KdfParameters::argon2id(vec![3; 16], 19 * 1024, 2, 1),
+        )
+        .unwrap();
+        let id = RecordId::new_v4();
+        let ciphertext = keys.encrypt(b"secret", &associated_data(id)).unwrap();
+        let mut store = RecordStore::new(keys);
+        let author = syncthing_core::DeviceId::random();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[31; 32]);
+        let create = Event::sign(
+            id,
+            RecordMutation::new(EventType::Create, ciphertext),
+            crate::version_vector::VersionVector::new(),
+            author,
+            1,
+            &signing_key,
+        )
+        .unwrap();
+        store.apply_event(&create, RecordType::SecureNote).unwrap();
+
+        let delete = Event::sign(
+            id,
+            RecordMutation::new(EventType::Delete, Vec::new()),
+            crate::version_vector::VersionVector::new(),
+            author,
+            2,
+            &signing_key,
+        )
+        .unwrap();
+        store.apply_event(&delete, RecordType::SecureNote).unwrap();
+        assert!(store.is_tombstone(id));
+        assert!(store.get_record(id).unwrap().is_none());
+        assert!(matches!(
+            store.update_record(id, b"resurrection".to_vec()),
+            Err(RecordError::Deleted(record_id)) if record_id == id
+        ));
+
+        let restore = Event::sign(
+            id,
+            RecordMutation::new(EventType::Restore, Vec::new()),
+            crate::version_vector::VersionVector::new(),
+            author,
+            3,
+            &signing_key,
+        )
+        .unwrap();
+        store.apply_event(&restore, RecordType::SecureNote).unwrap();
+        assert!(!store.is_tombstone(id));
+        assert_eq!(store.get_record(id).unwrap().unwrap().payload, b"secret");
     }
 }
