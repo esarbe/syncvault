@@ -1,0 +1,21 @@
+[package]
+name = "syncthing-custom"
+version.workspace = true
+edition = "2021"
+
+publish = false
+
+[[bin]]
+name = "syncthing-custom"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+custom-protocol = { path = "../../crates/custom-protocol" }
+syncthing-core = { path = "../../crates/syncthing-core" }
+syncthing-net = { path = "../../crates/syncthing-net" }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

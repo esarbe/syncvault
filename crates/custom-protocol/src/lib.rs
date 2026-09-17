@@ -14,7 +14,10 @@ pub use connection::CustomConnection;
 pub use error::{ProtocolError, Result};
 pub use frame::{read_frame, write_frame, Frame, DEFAULT_MAX_FRAME_SIZE};
 pub use handshake::{negotiate_client, negotiate_server, ClientHello, ServerHello};
-pub use message::{Message, MessageType, PayloadAck, SendPayload};
+pub use message::{
+    Message, MessageType, PayloadAck, SendPayload, VaultMessage, VaultMessageType,
+    VAULT_PROTOCOL_NAME,
+};
 pub use session::CustomSession;
 
 pub const PROTOCOL_NAME: &str = "st-custom";

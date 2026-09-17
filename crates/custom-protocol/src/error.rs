@@ -8,10 +8,14 @@ pub enum ProtocolError {
     InvalidFrame(String),
     #[error("invalid message: {0}")]
     InvalidMessage(String),
+    #[error("session timeout: {0}")]
+    Timeout(String),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("unsupported protocol version: {0}")]
     UnsupportedVersion(u16),
+    #[error("incompatible capabilities: {0}")]
+    IncompatibleCapabilities(String),
     #[error("unauthorized peer device: {0}")]
     UnauthorizedPeer(String),
     #[error("serialization error: {0}")]

@@ -1,0 +1,23 @@
+[package]
+name = "vault-core"
+version.workspace = true
+edition = "2021"
+
+publish = false
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { workspace = true }
+hkdf = "0.12"
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+syncthing-core = { path = "../syncthing-core" }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

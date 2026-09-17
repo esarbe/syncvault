@@ -33,6 +33,7 @@ pub async fn negotiate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let required_capabilities = capabilities.clone();
     let hello = ClientHello {
         protocol: PROTOCOL_NAME.to_string(),
         version: PROTOCOL_VERSION,
@@ -47,6 +48,7 @@ where
         response.version,
         response.max_frame_size,
     )?;
+    validate_capabilities(&required_capabilities, &response.capabilities)?;
     verify_peer(response.device_id, expected_peer)?;
     Ok(response)
 }
@@ -60,8 +62,10 @@ pub async fn negotiate_server<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let required_capabilities = capabilities.clone();
     let request: ClientHello = receive_json(stream).await?;
     validate_hello(&request.protocol, request.version, request.max_frame_size)?;
+    validate_capabilities(&required_capabilities, &request.capabilities)?;
     verify_peer(request.device_id, expected_peer)?;
 
     let response = ServerHello {
@@ -98,6 +102,19 @@ fn verify_peer(peer: DeviceId, expected: Option<DeviceId>) -> Result<()> {
         return Err(ProtocolError::UnauthorizedPeer(peer.to_string()));
     }
     Ok(())
+}
+
+fn validate_capabilities(required: &[String], offered: &[String]) -> Result<()> {
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|capability| !offered.iter().any(|offered| offered == *capability))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(ProtocolError::IncompatibleCapabilities(missing.join(", ")))
 }
 
 async fn send_json<S, T>(stream: &mut S, value: &T) -> Result<()>
@@ -173,6 +190,31 @@ mod tests {
         assert!(matches!(
             server.await.unwrap(),
             Err(ProtocolError::UnauthorizedPeer(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_incompatible_capabilities() {
+        let (mut client_stream, mut server_stream) = duplex(4096);
+        let client_id = DeviceId::random();
+        let server_id = DeviceId::random();
+
+        let server = tokio::spawn(async move {
+            negotiate_server(
+                &mut server_stream,
+                server_id,
+                Some(client_id),
+                vec!["payload".to_string()],
+            )
+            .await
+        });
+        let client_result =
+            negotiate_client(&mut client_stream, client_id, Some(server_id), Vec::new()).await;
+
+        assert!(client_result.is_err());
+        assert!(matches!(
+            server.await.unwrap(),
+            Err(ProtocolError::IncompatibleCapabilities(_))
         ));
     }
 }
