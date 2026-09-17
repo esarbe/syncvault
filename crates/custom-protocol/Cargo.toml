@@ -7,9 +7,11 @@ publish = false
 
 [dependencies]
 bytes = { workspace = true }
+ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 syncthing-core = { path = "../syncthing-core" }
+vault-core = { path = "../vault-core" }

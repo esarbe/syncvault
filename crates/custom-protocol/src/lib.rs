@@ -9,6 +9,7 @@ pub mod frame;
 pub mod handshake;
 pub mod message;
 pub mod session;
+pub mod vault_session;
 
 pub use connection::CustomConnection;
 pub use error::{ProtocolError, Result};
@@ -19,6 +20,7 @@ pub use message::{
     VAULT_PROTOCOL_NAME,
 };
 pub use session::CustomSession;
+pub use vault_session::VaultSession;
 
 pub const PROTOCOL_NAME: &str = "st-custom";
 pub const PROTOCOL_VERSION: u16 = 1;
