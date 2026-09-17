@@ -10,6 +10,7 @@ pub mod event;
 pub mod history;
 pub mod keys;
 pub mod membership;
+pub mod persistence;
 pub mod record;
 pub mod sync;
 pub mod vault;
@@ -19,10 +20,15 @@ pub use auth::{AuthError, AuthRequest, AuthResponse, VaultAuthenticator};
 pub use conflict::{Conflict, ConflictError, ConflictId, ConflictStore};
 pub use event::{Event, EventError, EventId, EventType, RecordMutation};
 pub use history::{EventHistory, HistoryError};
-pub use keys::{derive_master_key, EncryptedKeyHierarchy, KeyError, VaultKeys};
+pub use keys::{
+    derive_master_key, EncryptedKeyHierarchy, KeyError, KeyRotation, VaultKeyRing, VaultKeys,
+};
 pub use membership::{
-    MemberRole, MembershipChange, MembershipChangeType, MembershipError, MembershipOperation,
-    MembershipStore, VaultMember,
+    DeviceEnrollment, MemberRole, MembershipChange, MembershipChangeType, MembershipError,
+    MembershipOperation, MembershipStore, VaultMember,
+};
+pub use persistence::{
+    PersistedEventIndexEntry, PersistenceError, VaultPersistence, VaultSnapshot,
 };
 pub use record::{EncryptedRecord, RecordData, RecordError, RecordId, RecordStore, RecordType};
 pub use sync::{

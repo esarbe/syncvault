@@ -21,3 +21,4 @@ zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }

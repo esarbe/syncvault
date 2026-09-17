@@ -292,4 +292,57 @@ mod tests {
             Err(AuthError::InvalidSigner)
         );
     }
+
+    #[test]
+    fn revoked_member_cannot_authenticate_after_owner_revoke() {
+        let owner_key = SigningKey::from_bytes(&[13; 32]);
+        let member_key = SigningKey::from_bytes(&[14; 32]);
+        let owner_device = DeviceId::random();
+        let member_device = DeviceId::random();
+        let owner = VaultMember {
+            member_id: Uuid::new_v4(),
+            device_id: owner_device,
+            public_key: owner_key.verifying_key().to_bytes().to_vec(),
+            encrypted_vault_key: vec![1; 32],
+            role: MemberRole::Owner,
+            created_at: 1,
+            revoked_at: None,
+        };
+        let member = VaultMember {
+            member_id: Uuid::new_v4(),
+            device_id: member_device,
+            public_key: member_key.verifying_key().to_bytes().to_vec(),
+            encrypted_vault_key: vec![2; 32],
+            role: MemberRole::Reader,
+            created_at: 1,
+            revoked_at: None,
+        };
+        let member_id = member.member_id;
+        let vault_id = Uuid::new_v4();
+        let mut members = MembershipStore::new();
+        members.insert_member(owner.clone()).unwrap();
+        members.enroll_member(&owner, member, &owner_key).unwrap();
+
+        let mut authenticator = VaultAuthenticator::new(vault_id, members.clone());
+        let request =
+            VaultAuthenticator::request(vault_id, member_id, member_device, vec![6; 16]).unwrap();
+        let response = authenticator
+            .respond(&request, member_device, &member_key)
+            .unwrap();
+        let mut verifier = VaultAuthenticator::new(vault_id, members.clone());
+        verifier
+            .verify_response(&request, &response, member_device)
+            .unwrap();
+
+        let mut revoked_members = members;
+        let change = revoked_members
+            .revoke_member(&owner, member_id, &owner_key, 2)
+            .unwrap();
+        change.verify(&owner_key.verifying_key()).unwrap();
+        let mut revoked_authenticator = VaultAuthenticator::new(vault_id, revoked_members);
+        assert_eq!(
+            revoked_authenticator.respond(&request, member_device, &member_key),
+            Err(AuthError::RevokedMember)
+        );
+    }
 }

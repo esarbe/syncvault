@@ -62,6 +62,15 @@ pub struct MembershipChange {
     pub signature: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceEnrollment {
+    pub enrollment_id: Uuid,
+    pub member: VaultMember,
+    pub actor: DeviceId,
+    pub timestamp: i64,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MembershipError {
     #[error("member not found: {0}")]
@@ -80,6 +89,8 @@ pub enum MembershipError {
     InvalidPublicKey,
     #[error("membership change serialization failed")]
     Serialization,
+    #[error("encrypted vault key is empty")]
+    EmptyEncryptedVaultKey,
 }
 
 pub type Result<T> = std::result::Result<T, MembershipError>;
@@ -136,6 +147,32 @@ impl MembershipStore {
         )?;
         self.members.insert(member.member_id, member);
         Ok(change)
+    }
+
+    pub fn enroll_member(
+        &mut self,
+        actor: &VaultMember,
+        member: VaultMember,
+        signing_key: &SigningKey,
+    ) -> Result<DeviceEnrollment> {
+        self.authorize(actor, MembershipOperation::AddMember)?;
+        validate_public_key(&member.public_key)?;
+        if member.encrypted_vault_key.is_empty() {
+            return Err(MembershipError::EmptyEncryptedVaultKey);
+        }
+        if self.members.contains_key(&member.member_id) {
+            return Err(MembershipError::AlreadyExists(member.member_id));
+        }
+        if self
+            .members
+            .values()
+            .any(|existing| existing.device_id == member.device_id)
+        {
+            return Err(MembershipError::DeviceAlreadyMember(member.device_id));
+        }
+        let enrollment = DeviceEnrollment::new(member.clone(), actor.device_id, signing_key)?;
+        self.members.insert(member.member_id, member);
+        Ok(enrollment)
     }
 
     pub fn revoke_member(
@@ -248,6 +285,38 @@ impl MembershipChange {
     }
 }
 
+impl DeviceEnrollment {
+    fn new(member: VaultMember, actor: DeviceId, signing_key: &SigningKey) -> Result<Self> {
+        let mut enrollment = Self {
+            enrollment_id: Uuid::new_v4(),
+            member,
+            actor,
+            timestamp: unix_timestamp(),
+            signature: Vec::new(),
+        };
+        let mut unsigned = enrollment.clone();
+        unsigned.signature.clear();
+        enrollment.signature = serde_json::to_vec(&unsigned)
+            .map_err(|_| MembershipError::Serialization)
+            .map(|bytes| signing_key.sign(&bytes).to_bytes().to_vec())?;
+        Ok(enrollment)
+    }
+
+    pub fn verify(&self, verifying_key: &VerifyingKey) -> Result<()> {
+        let signature: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| MembershipError::InvalidSignature)?;
+        let mut unsigned = self.clone();
+        unsigned.signature.clear();
+        let bytes = serde_json::to_vec(&unsigned).map_err(|_| MembershipError::Serialization)?;
+        verifying_key
+            .verify(&bytes, &Signature::from_bytes(&signature))
+            .map_err(|_| MembershipError::InvalidSignature)
+    }
+}
+
 fn validate_public_key(public_key: &[u8]) -> Result<()> {
     VerifyingKey::from_bytes(
         public_key
@@ -330,6 +399,55 @@ mod tests {
         assert_eq!(
             store.authorize(&writer, MembershipOperation::Read),
             Err(MembershipError::Revoked)
+        );
+    }
+
+    #[test]
+    fn owner_enrolls_new_device_with_signed_wrapped_key() {
+        let owner_key = SigningKey::from_bytes(&[6; 32]);
+        let device_key = SigningKey::from_bytes(&[7; 32]);
+        let owner = member(&owner_key, MemberRole::Owner);
+        let new_member = VaultMember {
+            member_id: Uuid::new_v4(),
+            device_id: DeviceId::random(),
+            public_key: device_key.verifying_key().to_bytes().to_vec(),
+            encrypted_vault_key: vec![9; 48],
+            role: MemberRole::Reader,
+            created_at: 2,
+            revoked_at: None,
+        };
+        let new_id = new_member.member_id;
+        let wrapped_key = new_member.encrypted_vault_key.clone();
+        let mut store = MembershipStore::new();
+        store.insert_member(owner.clone()).unwrap();
+
+        let enrollment = store.enroll_member(&owner, new_member, &owner_key).unwrap();
+        enrollment.verify(&owner_key.verifying_key()).unwrap();
+        assert_eq!(
+            store.find_member(new_id).unwrap().encrypted_vault_key,
+            wrapped_key
+        );
+        assert!(store.find_member(new_id).unwrap().is_active());
+    }
+
+    #[test]
+    fn non_owner_or_empty_wrapped_key_cannot_enroll() {
+        let owner_key = SigningKey::from_bytes(&[8; 32]);
+        let writer_key = SigningKey::from_bytes(&[9; 32]);
+        let owner = member(&owner_key, MemberRole::Owner);
+        let writer = member(&writer_key, MemberRole::Writer);
+        let mut store = MembershipStore::new();
+        store.insert_member(owner.clone()).unwrap();
+        store.insert_member(writer.clone()).unwrap();
+        let mut candidate = member(&SigningKey::from_bytes(&[10; 32]), MemberRole::Reader);
+        candidate.encrypted_vault_key.clear();
+        assert_eq!(
+            store.enroll_member(&writer, candidate.clone(), &writer_key),
+            Err(MembershipError::Unauthorized)
+        );
+        assert_eq!(
+            store.enroll_member(&owner, candidate, &owner_key),
+            Err(MembershipError::EmptyEncryptedVaultKey)
         );
     }
 }

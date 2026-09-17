@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::SigningKey;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::event::{Event, EventError, EventId, RecordMutation};
@@ -12,7 +13,7 @@ use syncthing_core::DeviceId;
 
 pub type ConflictId = Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Conflict {
     pub conflict_id: ConflictId,
     pub record_id: RecordId,
