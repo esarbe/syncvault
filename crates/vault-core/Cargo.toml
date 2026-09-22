@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 syncthing-core = { path = "../syncthing-core" }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]

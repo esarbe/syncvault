@@ -85,7 +85,7 @@ impl ConflictStore {
             }
             if !conflict.branches.iter().enumerate().all(|(index, branch)| {
                 conflict.branches.iter().skip(index + 1).all(|other| {
-                    branch.causal_version().compare(other.causal_version())
+                    event_version(branch).compare(&event_version(other))
                         == VersionOrdering::Concurrent
                 })
             }) {
@@ -110,7 +110,7 @@ impl ConflictStore {
         if left.record_id() != right.record_id() {
             return Err(ConflictError::DifferentRecords);
         }
-        if left.causal_version().compare(right.causal_version()) != VersionOrdering::Concurrent {
+        if event_version(&left).compare(&event_version(&right)) != VersionOrdering::Concurrent {
             return Err(ConflictError::NotConcurrent);
         }
         let id = ConflictId::new_v4();
@@ -165,6 +165,12 @@ impl ConflictStore {
         conflict.resolution_event_id = Some(event.event_id());
         Ok(event)
     }
+}
+
+fn event_version(event: &Event) -> VersionVector {
+    let mut version = event.causal_version().clone();
+    version.observe(event.author(), event.device_sequence());
+    version
 }
 
 #[cfg(test)]

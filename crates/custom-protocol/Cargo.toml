@@ -15,3 +15,6 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 syncthing-core = { path = "../syncthing-core" }
 vault-core = { path = "../vault-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -599,6 +599,9 @@ low-level stores directly.
 
 ## 23. Define record and conflict presentation semantics
 
+**Status: implemented** in `vault-core::record_document` and
+`vault-core::service`.
+
 Define a versioned plaintext record document inside the encrypted payload. It
 must support:
 
@@ -613,13 +616,27 @@ keeping the synchronization protocol payload opaque.
 Define deterministic record-name lookup behavior, including duplicate-name
 handling and whether commands may accept a `RecordId` to disambiguate.
 
+Names use exact, case-sensitive matching and must be unique among live records.
+Deleted records do not reserve a name, but restoring a tombstone fails if its
+name has since been reused. Commands may use `RecordId` for explicit lookup and
+must use it to address tombstones.
+
 Define conflict display and resolution inputs. Resolution must explicitly
 select a branch or provide a merged record value before creating the signed
 resolution event.
 
+The outer `RecordType` is immutable. Conflict views expose branch event IDs,
+authors, device sequences, and decoded documents where the mutation contains a
+payload. Resolution accepts either a branch `EventId` or a validated merged
+`RecordDocument`.
+
 ---
 
 ## 24. Complete vault protocol dispatch and sync orchestration
+
+**Status: implemented** in `vault-core::auth`, `vault-core::service`,
+`custom-protocol::vault_payload`, `custom-protocol::vault_session`, and
+`syncthing-custom`.
 
 Extend the authenticated vault session beyond `AUTH_REQUEST` and
 `AUTH_RESPONSE`.
@@ -650,9 +667,27 @@ Add client-side synchronization orchestration and a server-side vault listener.
 Peer selection must resolve a configured device and address from the vault
 registry or require them explicitly.
 
+The implemented session performs mutually signed vault-member authentication
+bound to the TLS device IDs, exchanges bounded summaries and event batches,
+acknowledges every transferred batch, and repeats until both version vectors
+converge. `VAULT_INFO` and synchronization messages dispatch through
+`VaultService`; unsupported administrative messages return typed `ERROR`
+responses rather than succeeding silently. The executable supports an
+explicit peer/address for synchronization and an optional expected peer for a
+single-vault listener. Passwords are read from files rather than command-line
+arguments.
+
+Session tests use independently opened service instances and cover convergence,
+duplicate delivery, and unauthorized TLS identity rejection. Provisioning a
+second persisted local identity for the same vault still requires an enrolled
+vault import lifecycle; that lifecycle is outside protocol dispatch and must be
+completed before the two-device E2E in step 29.
+
 ---
 
 ## 25. Define the CLI contract and support utilities
+
+**Status: implemented** in `syncthing-custom::vault_cli`.
 
 Use the command hierarchy:
 
@@ -673,9 +708,18 @@ Add reusable support for secure password prompts, `$EDITOR` integration through
 a permission-restricted temporary file, confirmation prompts, structured JSON
 output, secret redaction, and stable process exit codes.
 
+The CLI supports terminal-hidden password prompts with confirmation on create,
+password files for unattended use, `$VISUAL`/`$EDITOR` commands with arguments,
+owner-only temporary editor files on Unix, `--yes` confirmation bypass,
+redacted JSON views, UUID-or-exact-name record references, and Clap's stable
+usage-error exit behavior. Operational failures return a nonzero application
+exit status.
+
 ---
 
 ## 26. Add CLI operations
+
+**Status: implemented** in `cmd/syncthing-custom`.
 
 Extend the existing binary with commands similar to:
 
@@ -705,9 +749,87 @@ Extend the existing binary with commands similar to:
 
 Keep CLI code thin.
 
+The command tree is `vault info`, `vault list`, `vault create <name>`, and
+`vault <name> ...`. Named-vault operations implement device listing/add/revoke,
+record list/create/get/update/edit/delete/restore, history queries, conflict
+display and branch-or-merge resolution, synchronization by configured or
+explicit peer, and a single-vault listener. The existing generic `listen` and
+`send` commands remain available.
+
 ---
 
-## 27. Test in layers
+## 27. Implement device identity provisioning and vault import
+
+**Status: Implemented.**
+
+Close the device-enrollment workflow gap exposed by `add-device`. A new device
+must be able to create and retain the Ed25519 identity used for vault event
+signing, publish only its public identity, receive enrollment material from an
+existing owner, and import that material as a locally usable vault.
+
+Add commands similar to:
+
+        device-key generate
+        device-key show
+        vault <name> enrollment prepare
+        vault import <enrollment-file>
+
+Define one versioned enrollment document containing only the data required to
+bind the new local identity to the shared vault:
+
+        vault ID and protocol version
+        assigned member ID and role
+        member DeviceId and Ed25519 public key
+        encrypted vault/history key material for that member
+        current membership and signed membership changes
+        configured peer DeviceId and address
+
+Requirements:
+
+- Generate the signing key locally with a cryptographically secure RNG.
+- Persist the private signing key encrypted at rest with a locally supplied
+    password; never print, log, or transfer it.
+- Print or export only the public key and stable device identity needed by the
+    owner for `add-device`.
+- Bind enrollment material to the intended DeviceId, member ID, public key, and
+    vault ID, and require an owner signature over the complete document.
+- Reject altered, replayed, expired, wrong-device, wrong-vault, duplicate, or
+    revoked enrollment material.
+- Import into a new UUID-based registry path using atomic writes and private
+    file permissions, without overwriting an existing vault or identity.
+- Verify the supplied vault password and key hierarchy before committing the
+    registry entry.
+- Store the peer address in `VaultRegistryEntry.peers` so `vault <name> sync`
+    can resolve a unique configured peer without explicit flags.
+- Support redacted structured JSON output and password-file automation while
+    keeping all private and wrapped key material out of normal command output.
+
+Add restart tests proving the imported vault unlocks with the new device's
+private signing key, plus rejection tests for tampering, wrong recipients,
+duplicate imports, and insecure output. Complete this step before claiming a
+true two-device synchronization test.
+
+Implementation notes:
+
+- `DeviceIdentityStore` creates an Ed25519 signing key and a separate X25519
+    wrapping key, encrypts both private keys under Argon2id plus
+    XChaCha20-Poly1305, and exports only the bound public identity.
+- `device-key request` creates the signed, expiring public enrollment request
+    consumed by `vault <name> enrollment prepare`.
+- The owner signs the complete recipient-sealed bundle and commits the same
+    signed membership state carried by its encrypted snapshot.
+- `vault import` anchors the owner signature to an active owner member,
+    validates the intended recipient, rebuilds recipient-local password and
+    signing-key wrappers, persists the configured owner peer, and records the
+    enrollment ID for durable replay rejection.
+- Focused domain and CLI tests cover encrypted identity restart, wrong
+    passwords, request expiration and tampering, transferred-record decryption,
+    restart unlock, peer persistence, wrong recipients, replay, and bundle
+    tampering.
+
+---
+
+## 28. Test in layers
 
 ### Crypto
 
@@ -758,7 +880,7 @@ Keep CLI code thin.
 
 ---
 
-## 28. Two-device end-to-end test
+## 29. Two-device end-to-end test
 
 Start:
 
@@ -800,7 +922,7 @@ Reconnect:
 
 ---
 
-## 29. Security review before release
+## 30. Security review before release
 
 Verify explicitly:
 
@@ -820,7 +942,7 @@ Verify explicitly:
 
 ---
 
-## 30. Final implementation order
+## 31. Final implementation order
 
 Implement in this order:
 
@@ -848,10 +970,11 @@ Implement in this order:
 22. record and conflict presentation semantics
 23. vault protocol dispatch and sync orchestration
 24. CLI contract and support utilities
-25. CLI integration
-26. persistence/recovery testing
-27. two-device end-to-end tests
-28. security review
+25. CLI operations
+26. device identity provisioning and enrolled-vault import
+27. layered tests
+28. two-device end-to-end test
+29. security review
 
 The critical dependency chain is:
 

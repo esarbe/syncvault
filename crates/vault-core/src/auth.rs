@@ -11,6 +11,7 @@ use crate::vault::VaultId;
 use syncthing_core::DeviceId;
 
 const AUTH_CONTEXT: &[u8] = b"st-vault/1/auth";
+const MAX_AUTH_NONCE_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthRequest {
@@ -18,6 +19,7 @@ pub struct AuthRequest {
     pub member_id: Uuid,
     pub device_id: DeviceId,
     pub nonce: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +43,8 @@ pub enum AuthError {
     DeviceMismatch,
     #[error("authentication nonce is empty")]
     EmptyNonce,
+    #[error("authentication nonce exceeds the maximum size")]
+    NonceTooLarge,
     #[error("authentication nonce was already used")]
     ReplayedNonce,
     #[error("authentication signature is invalid")]
@@ -73,29 +77,47 @@ impl VaultAuthenticator {
         member_id: Uuid,
         device_id: DeviceId,
         nonce: Vec<u8>,
+        signing_key: &SigningKey,
     ) -> Result<AuthRequest> {
         if nonce.is_empty() {
             return Err(AuthError::EmptyNonce);
         }
-        Ok(AuthRequest {
+        if nonce.len() > MAX_AUTH_NONCE_SIZE {
+            return Err(AuthError::NonceTooLarge);
+        }
+        let mut request = AuthRequest {
             vault_id,
             member_id,
             device_id,
             nonce,
-        })
+            signature: Vec::new(),
+        };
+        request.signature = signing_key
+            .sign(&authentication_bytes(&request))
+            .to_bytes()
+            .to_vec();
+        Ok(request)
     }
 
     pub fn respond(
         &mut self,
         request: &AuthRequest,
         tls_peer: DeviceId,
+        responder_member_id: Uuid,
+        responder_device_id: DeviceId,
         signing_key: &SigningKey,
     ) -> Result<AuthResponse> {
         self.validate_request(request, tls_peer)?;
         let member = self
             .members
-            .find_member(request.member_id)
+            .find_member(responder_member_id)
             .ok_or(AuthError::UnknownMember)?;
+        if !member.is_active() {
+            return Err(AuthError::RevokedMember);
+        }
+        if member.device_id != responder_device_id {
+            return Err(AuthError::DeviceMismatch);
+        }
         let public_key: [u8; 32] = member
             .public_key
             .as_slice()
@@ -113,8 +135,8 @@ impl VaultAuthenticator {
         self.used_nonces.insert(request.nonce.clone());
         Ok(AuthResponse {
             vault_id: request.vault_id,
-            member_id: request.member_id,
-            device_id: tls_peer,
+            member_id: responder_member_id,
+            device_id: responder_device_id,
             nonce: request.nonce.clone(),
             signature,
         })
@@ -126,15 +148,10 @@ impl VaultAuthenticator {
         response: &AuthResponse,
         tls_peer: DeviceId,
     ) -> Result<()> {
-        self.validate_request(request, tls_peer)?;
         if response.vault_id != self.vault_id || response.vault_id != request.vault_id {
             return Err(AuthError::WrongVault);
         }
-        if response.member_id != request.member_id
-            || response.device_id != request.device_id
-            || response.device_id != tls_peer
-            || response.nonce != request.nonce
-        {
+        if response.device_id != tls_peer || response.nonce != request.nonce {
             return Err(AuthError::DeviceMismatch);
         }
         let member = self
@@ -143,6 +160,9 @@ impl VaultAuthenticator {
             .ok_or(AuthError::UnknownMember)?;
         if !member.is_active() {
             return Err(AuthError::RevokedMember);
+        }
+        if member.device_id != response.device_id {
+            return Err(AuthError::DeviceMismatch);
         }
         let public_key: [u8; 32] = member
             .public_key
@@ -175,6 +195,9 @@ impl VaultAuthenticator {
         if request.nonce.is_empty() {
             return Err(AuthError::EmptyNonce);
         }
+        if request.nonce.len() > MAX_AUTH_NONCE_SIZE {
+            return Err(AuthError::NonceTooLarge);
+        }
         if request.device_id != tls_peer {
             return Err(AuthError::DeviceMismatch);
         }
@@ -188,6 +211,24 @@ impl VaultAuthenticator {
         if member.device_id != request.device_id {
             return Err(AuthError::DeviceMismatch);
         }
+        let public_key: [u8; 32] = member
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| AuthError::InvalidSignature)?;
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&public_key)
+            .map_err(|_| AuthError::InvalidSignature)?;
+        let signature: [u8; 64] = request
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| AuthError::InvalidSignatureLength)?;
+        verifying_key
+            .verify(
+                &authentication_bytes(request),
+                &Signature::from_bytes(&signature),
+            )
+            .map_err(|_| AuthError::InvalidSignature)?;
         if self.used_nonces.contains(&request.nonce) {
             return Err(AuthError::ReplayedNonce);
         }
@@ -243,8 +284,10 @@ mod tests {
     fn authenticates_authorized_member_and_rejects_replay() {
         let (mut verifier, key, vault_id, device_id, member_id) = setup(None);
         let request =
-            VaultAuthenticator::request(vault_id, member_id, device_id, vec![1; 32]).unwrap();
-        let response = verifier.respond(&request, device_id, &key).unwrap();
+            VaultAuthenticator::request(vault_id, member_id, device_id, vec![1; 32], &key).unwrap();
+        let response = verifier
+            .respond(&request, device_id, member_id, device_id, &key)
+            .unwrap();
         let mut client = VaultAuthenticator::new(verifier.vault_id, verifier.members.clone());
         client
             .verify_response(&request, &response, device_id)
@@ -259,36 +302,39 @@ mod tests {
     fn rejects_wrong_vault_revoked_member_and_device_mismatch() {
         let (mut verifier, key, vault_id, device_id, member_id) = setup(Some(2));
         let request =
-            VaultAuthenticator::request(vault_id, member_id, device_id, vec![2; 16]).unwrap();
+            VaultAuthenticator::request(vault_id, member_id, device_id, vec![2; 16], &key).unwrap();
         assert_eq!(
-            verifier.respond(&request, device_id, &key),
+            verifier.respond(&request, device_id, member_id, device_id, &key),
             Err(AuthError::RevokedMember)
         );
 
         let (mut verifier, key, _, device_id, member_id) = setup(None);
         let request =
-            VaultAuthenticator::request(Uuid::new_v4(), member_id, device_id, vec![3]).unwrap();
+            VaultAuthenticator::request(Uuid::new_v4(), member_id, device_id, vec![3], &key)
+                .unwrap();
         assert_eq!(
-            verifier.respond(&request, device_id, &key),
+            verifier.respond(&request, device_id, member_id, device_id, &key),
             Err(AuthError::WrongVault)
         );
 
         let request =
-            VaultAuthenticator::request(verifier.vault_id, member_id, device_id, vec![4]).unwrap();
+            VaultAuthenticator::request(verifier.vault_id, member_id, device_id, vec![4], &key)
+                .unwrap();
         let wrong_peer = DeviceId::random();
         assert_eq!(
-            verifier.respond(&request, wrong_peer, &key),
+            verifier.respond(&request, wrong_peer, member_id, device_id, &key),
             Err(AuthError::DeviceMismatch)
         );
     }
 
     #[test]
     fn rejects_response_from_wrong_private_key() {
-        let (mut verifier, _, vault_id, device_id, member_id) = setup(None);
-        let request = VaultAuthenticator::request(vault_id, member_id, device_id, vec![5]).unwrap();
+        let (mut verifier, key, vault_id, device_id, member_id) = setup(None);
+        let request =
+            VaultAuthenticator::request(vault_id, member_id, device_id, vec![5], &key).unwrap();
         let wrong_key = SigningKey::from_bytes(&[12; 32]);
         assert_eq!(
-            verifier.respond(&request, device_id, &wrong_key),
+            verifier.respond(&request, device_id, member_id, device_id, &wrong_key),
             Err(AuthError::InvalidSigner)
         );
     }
@@ -324,10 +370,22 @@ mod tests {
         members.enroll_member(&owner, member, &owner_key).unwrap();
 
         let mut authenticator = VaultAuthenticator::new(vault_id, members.clone());
-        let request =
-            VaultAuthenticator::request(vault_id, member_id, member_device, vec![6; 16]).unwrap();
+        let request = VaultAuthenticator::request(
+            vault_id,
+            member_id,
+            member_device,
+            vec![6; 16],
+            &member_key,
+        )
+        .unwrap();
         let response = authenticator
-            .respond(&request, member_device, &member_key)
+            .respond(
+                &request,
+                member_device,
+                member_id,
+                member_device,
+                &member_key,
+            )
             .unwrap();
         let mut verifier = VaultAuthenticator::new(vault_id, members.clone());
         verifier
@@ -341,7 +399,13 @@ mod tests {
         change.verify(&owner_key.verifying_key()).unwrap();
         let mut revoked_authenticator = VaultAuthenticator::new(vault_id, revoked_members);
         assert_eq!(
-            revoked_authenticator.respond(&request, member_device, &member_key),
+            revoked_authenticator.respond(
+                &request,
+                member_device,
+                member_id,
+                member_device,
+                &member_key,
+            ),
             Err(AuthError::RevokedMember)
         );
     }

@@ -3,10 +3,19 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use custom_protocol::{negotiate_client, negotiate_server, CustomConnection, PayloadAck};
+use custom_protocol::{
+    negotiate_client, negotiate_server, CustomConnection, PayloadAck, VaultSession,
+    VAULT_PROTOCOL_NAME,
+};
 use syncthing_core::DeviceId;
 use syncthing_net::SyncthingTlsConfig;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use vault_core::VaultService;
+
+use crate::vault_cli::{DeviceKeyArgs, VaultAction, VaultArgs, VaultCliContext};
+
+mod vault_cli;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:22002";
 
@@ -16,6 +25,15 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:22002";
 struct Cli {
     #[arg(long, value_name = "DIR")]
     config: PathBuf,
+
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[arg(long, global = true)]
+    yes: bool,
+
+    #[arg(long, global = true, value_name = "FILE")]
+    password_file: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -28,6 +46,10 @@ enum Command {
         listen: String,
         #[arg(long, value_parser = parse_device_id)]
         peer: Option<DeviceId>,
+        #[arg(long, requires = "password_file")]
+        vault: Option<String>,
+        #[arg(long, value_name = "FILE", requires = "vault")]
+        password_file: Option<PathBuf>,
     },
     Send {
         #[arg(long, value_parser = parse_device_id)]
@@ -39,89 +61,32 @@ enum Command {
         #[arg(long, default_value = "text")]
         payload_type: String,
     },
-    Vault {
-        #[command(subcommand)]
-        command: VaultCommand,
-    },
-    Record {
-        vault: String,
-        #[command(subcommand)]
-        command: RecordCommand,
-    },
-    History {
-        vault: String,
-        record: Option<String>,
-    },
-    Conflicts {
-        vault: String,
-        #[command(subcommand)]
-        command: ConflictCommand,
-    },
-    Sync {
-        vault: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum VaultCommand {
-    Info,
-    List,
-    Create {
-        name: String,
-    },
-    Devices {
-        #[command(subcommand)]
-        command: DeviceCommand,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum DeviceCommand {
-    Add,
-    Revoke { device_id: String },
-}
-
-#[derive(Subcommand, Debug)]
-enum RecordCommand {
-    List,
-    Create {
-        record_type: String,
-        name: String,
-    },
-    Get {
-        name: String,
-    },
-    Update {
-        name: String,
-        #[arg(short = 'f', long = "field", value_names = ["FIELD", "VALUE"], num_args = 2)]
-        fields: Vec<String>,
-    },
-    Edit {
-        name: String,
-    },
-    Delete {
-        name: String,
-    },
-    Restore {
-        name: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ConflictCommand {
-    Show,
-    Resolve { conflict_id: String },
+    DeviceKey(DeviceKeyArgs),
+    Vault(VaultArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = cli.config.clone();
     let tls_config = SyncthingTlsConfig::load_or_generate(&cli.config)
         .await
         .context("failed to load custom protocol TLS identity")?;
 
     match cli.command {
-        Command::Listen { listen, peer } => listen_for_connections(tls_config, &listen, peer).await,
+        Command::Listen {
+            listen,
+            peer,
+            vault,
+            password_file,
+        } => {
+            if let (Some(vault), Some(password_file)) = (vault, password_file) {
+                let service = vault_cli::unlock_service(&cli.config, &vault, Some(&password_file))?;
+                serve_vault(tls_config, &listen, service, peer).await
+            } else {
+                listen_for_connections(tls_config, &listen, peer).await
+            }
+        }
         Command::Send {
             peer,
             addr,
@@ -134,42 +99,43 @@ async fn main() -> Result<()> {
             println!("payload acknowledged by {peer_id}: {}", ack.message_id);
             Ok(())
         }
-        Command::Vault { command } => handle_vault_command(&tls_config, command),
-        Command::Record { vault, command } => {
-            service_required(&format!("record command for vault '{vault}' ({command:?})"))
-        }
-        Command::History { vault, record } => service_required(&format!(
-            "history command for vault '{vault}'{}",
-            record
-                .map(|record| format!(" and record '{record}'"))
-                .unwrap_or_default()
-        )),
-        Command::Conflicts { vault, command } => service_required(&format!(
-            "conflict command for vault '{vault}' ({command:?})"
-        )),
-        Command::Sync { vault } => service_required(&format!("sync command for vault '{vault}'")),
+        Command::DeviceKey(args) => vault_cli::execute_device_key(
+            args,
+            VaultCliContext {
+                config: &config,
+                password_file: cli.password_file.as_deref(),
+                json: cli.json,
+                yes: cli.yes,
+                local_device_id: tls_config.device_id(),
+            },
+        ),
+        Command::Vault(args) => match vault_cli::execute(
+            args,
+            VaultCliContext {
+                config: &config,
+                password_file: cli.password_file.as_deref(),
+                json: cli.json,
+                yes: cli.yes,
+                local_device_id: tls_config.device_id(),
+            },
+        )? {
+            VaultAction::Done => Ok(()),
+            VaultAction::Sync {
+                mut service,
+                peer,
+                address,
+            } => {
+                let mut nonce = vec![0_u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+                sync_vault_with_peer(&tls_config, &address, peer, &mut service, nonce).await
+            }
+            VaultAction::Serve {
+                service,
+                listen,
+                peer,
+            } => serve_vault(tls_config, &listen, service, peer).await,
+        },
     }
-}
-
-fn handle_vault_command(tls_config: &SyncthingTlsConfig, command: VaultCommand) -> Result<()> {
-    match command {
-        VaultCommand::Info => {
-            println!("device_id: {}", tls_config.device_id());
-            println!("protocol: st-vault/1");
-            Ok(())
-        }
-        VaultCommand::List => service_required("vault list"),
-        VaultCommand::Create { name } => service_required(&format!("vault create '{name}'")),
-        VaultCommand::Devices { command } => {
-            service_required(&format!("vault devices ({command:?})"))
-        }
-    }
-}
-
-fn service_required(operation: &str) -> Result<()> {
-    anyhow::bail!(
-        "{operation} requires the vault service; the CLI command surface is ready, but no vault is unlocked"
-    )
 }
 
 async fn listen_for_connections(
@@ -250,6 +216,91 @@ async fn send_payload_to_peer(
         .await
         .context("custom payload exchange failed")?;
     Ok((peer_id, ack))
+}
+
+async fn serve_vault(
+    tls_config: SyncthingTlsConfig,
+    listen: &str,
+    service: VaultService,
+    expected_peer: Option<DeviceId>,
+) -> Result<()> {
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed to bind vault listener at {listen}"))?;
+    let tls_config = Arc::new(tls_config);
+    let service = Arc::new(Mutex::new(service));
+    let local_id = tls_config.device_id();
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("failed to accept vault connection")?;
+        let tls_config = Arc::clone(&tls_config);
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            if let Err(error) =
+                handle_vault_connection(stream, tls_config, service, local_id, expected_peer).await
+            {
+                eprintln!("vault incoming connection failed: {error}");
+            }
+        });
+    }
+}
+
+async fn handle_vault_connection(
+    stream: TcpStream,
+    tls_config: Arc<SyncthingTlsConfig>,
+    service: Arc<Mutex<VaultService>>,
+    local_id: DeviceId,
+    expected_peer: Option<DeviceId>,
+) -> Result<()> {
+    let (mut tls_stream, peer_id) = syncthing_net::tls::accept_tls_stream(stream, &tls_config)
+        .await
+        .context("vault TLS handshake failed")?;
+    negotiate_server(
+        &mut tls_stream,
+        local_id,
+        expected_peer,
+        vec![VAULT_PROTOCOL_NAME.to_string()],
+    )
+    .await
+    .with_context(|| format!("vault handshake rejected for {peer_id}"))?;
+
+    let mut service = service.lock().await;
+    VaultSession::new(tls_stream, peer_id, local_id)
+        .serve(&mut service)
+        .await
+        .context("vault session failed")
+}
+
+async fn sync_vault_with_peer(
+    tls_config: &SyncthingTlsConfig,
+    address: &str,
+    expected_peer: DeviceId,
+    service: &mut VaultService,
+    nonce: Vec<u8>,
+) -> Result<()> {
+    let stream = TcpStream::connect(address)
+        .await
+        .with_context(|| format!("failed to connect to vault peer at {address}"))?;
+    let (mut tls_stream, peer_id) =
+        syncthing_net::tls::connect_tls_stream(stream, tls_config, Some(expected_peer))
+            .await
+            .context("vault TLS connection failed")?;
+    negotiate_client(
+        &mut tls_stream,
+        tls_config.device_id(),
+        Some(expected_peer),
+        vec![VAULT_PROTOCOL_NAME.to_string()],
+    )
+    .await
+    .context("vault protocol handshake failed")?;
+
+    VaultSession::new(tls_stream, peer_id, tls_config.device_id())
+        .synchronize(service, nonce)
+        .await
+        .context("vault synchronization failed")
 }
 
 fn parse_device_id(value: &str) -> Result<DeviceId, String> {

@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::keys::{EncryptedKeyHierarchy, KeyError, VaultKeys};
 use crate::membership::{MemberRole, VaultMember};
 use crate::persistence::{PersistenceError, VaultPersistence, VaultSnapshot};
+use crate::provisioning::{payload_keys, DeviceIdentity, EnrollmentBundle, ProvisioningError};
 use crate::vault::{KdfParameters, VaultHeader, VaultId, VaultMetadata};
 use crate::version_vector::VersionVector;
 
@@ -55,6 +56,8 @@ pub struct VaultRegistryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RegistryManifest {
     entries: Vec<VaultRegistryEntry>,
+    #[serde(default)]
+    consumed_enrollments: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +139,10 @@ pub enum VaultLifecycleError {
     Io(#[from] std::io::Error),
     #[error("vault registry serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("vault provisioning failed: {0}")]
+    Provisioning(#[from] ProvisioningError),
+    #[error("enrollment has already been imported")]
+    EnrollmentConsumed,
 }
 
 pub type Result<T> = std::result::Result<T, VaultLifecycleError>;
@@ -259,6 +266,90 @@ impl VaultRegistry {
         })
     }
 
+    pub fn import_enrollment(
+        &self,
+        name: &str,
+        password: &VaultPassword,
+        identity: &DeviceIdentity,
+        bundle: &EnrollmentBundle,
+        now: i64,
+    ) -> Result<UnlockedVault> {
+        validate_name(name)?;
+        bundle.verify(now)?;
+        if bundle.recipient != *identity.public() {
+            return Err(ProvisioningError::WrongRecipient.into());
+        }
+        let mut manifest = self.load_manifest()?;
+        if manifest
+            .consumed_enrollments
+            .contains(&bundle.enrollment_id)
+        {
+            return Err(VaultLifecycleError::EnrollmentConsumed);
+        }
+        if manifest.entries.iter().any(|entry| entry.name == name) {
+            return Err(VaultLifecycleError::AlreadyExists(name.to_string()));
+        }
+        if manifest
+            .entries
+            .iter()
+            .any(|entry| entry.vault_id == bundle.vault_id)
+        {
+            return Err(VaultLifecycleError::AlreadyExists(
+                bundle.vault_name.clone(),
+            ));
+        }
+
+        let payload = identity.open_bundle(bundle, now)?;
+        let keys = payload_keys(&payload)?;
+        let mut snapshot = payload.snapshot;
+        validate_enrollment_snapshot(bundle, &snapshot)?;
+
+        let mut salt = vec![0; SALT_SIZE];
+        OsRng.fill_bytes(&mut salt);
+        let kdf = KdfParameters::argon2id(salt, 64 * 1024, 3, 1);
+        let hierarchy = keys.wrap(password.expose(), &kdf)?;
+        snapshot.header.kdf = kdf;
+        snapshot.header.encrypted_vault_key = hierarchy.encrypted_vault_key;
+        snapshot.header.encrypted_history_key = hierarchy.encrypted_history_key;
+        snapshot.header.key_check = hierarchy.key_check;
+        snapshot.encrypted_signing_key = keys.encrypt(
+            identity.signing_key().as_bytes(),
+            &signing_key_associated_data(bundle.vault_id),
+        )?;
+
+        let storage_path = PathBuf::from(VAULT_DIRECTORY).join(format!("{}.json", bundle.vault_id));
+        let entry = VaultRegistryEntry {
+            name: name.to_string(),
+            vault_id: bundle.vault_id,
+            storage_path,
+            local_member_id: bundle.member_id,
+            peers: vec![VaultPeer {
+                device_id: bundle.owner_device_id,
+                address: bundle.owner_address.clone(),
+            }],
+        };
+        let persistence = VaultPersistence::new(self.resolve_storage_path(&entry)?);
+        persistence.save(&snapshot)?;
+        manifest.entries.push(entry.clone());
+        manifest
+            .entries
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        manifest.consumed_enrollments.push(bundle.enrollment_id);
+        if let Err(error) = self.save_manifest(&manifest) {
+            let _ = fs::remove_file(persistence.path());
+            return Err(error);
+        }
+
+        Ok(UnlockedVault {
+            metadata: snapshot.header.metadata(),
+            entry,
+            keys,
+            signing_key: identity.signing_key().clone(),
+            snapshot,
+            persistence,
+        })
+    }
+
     fn load_named_snapshot(&self, name: &str) -> Result<(VaultRegistryEntry, VaultSnapshot)> {
         validate_name(name)?;
         let entry = self
@@ -375,6 +466,45 @@ fn signing_key_associated_data(vault_id: VaultId) -> Vec<u8> {
     data
 }
 
+fn validate_enrollment_snapshot(bundle: &EnrollmentBundle, snapshot: &VaultSnapshot) -> Result<()> {
+    if snapshot.header.vault_id != bundle.vault_id
+        || snapshot.header.protocol_version != bundle.protocol_version
+        || snapshot.header.members != snapshot.members
+    {
+        return Err(VaultLifecycleError::InconsistentRegistry(
+            bundle.vault_name.clone(),
+        ));
+    }
+    let owner = snapshot
+        .members
+        .iter()
+        .find(|member| member.device_id == bundle.owner_device_id)
+        .ok_or_else(|| VaultLifecycleError::InconsistentRegistry(bundle.vault_name.clone()))?;
+    if !owner.is_active()
+        || owner.role != MemberRole::Owner
+        || owner.public_key != bundle.owner_public_key
+    {
+        return Err(VaultLifecycleError::InconsistentRegistry(
+            bundle.vault_name.clone(),
+        ));
+    }
+    let recipient = snapshot
+        .members
+        .iter()
+        .find(|member| member.member_id == bundle.member_id)
+        .ok_or_else(|| VaultLifecycleError::InconsistentRegistry(bundle.vault_name.clone()))?;
+    if !recipient.is_active()
+        || recipient.device_id != bundle.recipient.device_id
+        || recipient.public_key != bundle.recipient.signing_public_key
+        || recipient.role != bundle.role
+    {
+        return Err(VaultLifecycleError::InconsistentRegistry(
+            bundle.vault_name.clone(),
+        ));
+    }
+    Ok(())
+}
+
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -489,6 +619,7 @@ mod tests {
                 local_member_id: Uuid::new_v4(),
                 peers: Vec::new(),
             }],
+            consumed_enrollments: Vec::new(),
         };
         registry.save_manifest(&manifest).unwrap();
 

@@ -9,6 +9,7 @@ pub mod frame;
 pub mod handshake;
 pub mod message;
 pub mod session;
+pub mod vault_payload;
 pub mod vault_session;
 
 pub use connection::CustomConnection;
@@ -20,6 +21,11 @@ pub use message::{
     VAULT_PROTOCOL_NAME,
 };
 pub use session::CustomSession;
+pub use vault_payload::{
+    ErrorPayload, EventResultsPayload, GoodbyePayload, SyncCompletePayload, SyncEventsPayload,
+    SyncRequestPayload, SyncSummaryRequest, SyncSummaryResponse, ValidatePayload, VaultInfoRequest,
+    VaultInfoResponse,
+};
 pub use vault_session::VaultSession;
 
 pub const PROTOCOL_NAME: &str = "st-custom";

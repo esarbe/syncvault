@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::event::{Event, EventId};
 use crate::history::EventHistory;
 use crate::membership::MembershipStore;
-use crate::record::RecordId;
+use crate::record::{RecordId, RecordType};
 use crate::vault::VaultId;
 use crate::version_vector::{VersionOrdering, VersionVector};
 use syncthing_core::DeviceId;
@@ -42,7 +42,13 @@ pub struct MissingEventsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncEvents {
     pub vault_id: VaultId,
-    pub events: Vec<Event>,
+    pub events: Vec<TransferredEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferredEvent {
+    pub event: Event,
+    pub record_type: RecordType,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,7 +62,8 @@ pub struct EventReject {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventTransferResult {
     Accepted(EventAck),
     Duplicate(EventAck),
@@ -69,9 +76,14 @@ pub enum EventTransferError {
     WrongVault,
     #[error("event batch exceeds the maximum size")]
     BatchTooLarge,
+    #[error("event request exceeds the maximum number of ranges")]
+    TooManyRanges,
+    #[error("event request contains an invalid range")]
+    InvalidRange,
 }
 
 pub const MAX_SYNC_EVENTS: usize = 256;
+pub const MAX_EVENT_RANGES: usize = 64;
 
 pub struct EventTransfer<'a> {
     vault_id: VaultId,
@@ -105,7 +117,8 @@ impl<'a> EventTransfer<'a> {
         }
 
         let mut results = Vec::with_capacity(batch.events.len());
-        for event in batch.events {
+        for transferred in batch.events {
+            let event = transferred.event;
             let event_id = event.event_id();
             if self.history.get(event_id).is_some() {
                 results.push(EventTransferResult::Duplicate(EventAck { event_id }));
@@ -494,7 +507,10 @@ mod tests {
         let mut transfer = EventTransfer::new(vault_id, &mut history, &members);
         let batch = SyncEvents {
             vault_id,
-            events: vec![event.clone()],
+            events: vec![TransferredEvent {
+                event: event.clone(),
+                record_type: RecordType::Custom,
+            }],
         };
         assert_eq!(
             transfer.apply(batch.clone(), &[range]).unwrap(),
@@ -533,7 +549,10 @@ mod tests {
         .unwrap();
         let batch = SyncEvents {
             vault_id: VaultId::new_v4(),
-            events: vec![event.clone()],
+            events: vec![TransferredEvent {
+                event: event.clone(),
+                record_type: RecordType::Custom,
+            }],
         };
         let mut transfer = EventTransfer::new(batch.vault_id, &mut history, &members);
         assert!(matches!(
@@ -580,7 +599,10 @@ mod tests {
             .apply(
                 SyncEvents {
                     vault_id: revoked_vault_id,
-                    events: vec![revoked_event],
+                    events: vec![TransferredEvent {
+                        event: revoked_event,
+                        record_type: RecordType::Custom,
+                    }],
                 },
                 &[EventRange {
                     device_id: device,

@@ -74,6 +74,10 @@ impl RecordStore {
         }
     }
 
+    pub(crate) fn keys(&self) -> &VaultKeys {
+        &self.keys
+    }
+
     pub fn from_records(keys: VaultKeys, records: Vec<EncryptedRecord>) -> Result<Self> {
         let mut store = Self::new(keys);
         for record in records {
@@ -215,6 +219,10 @@ impl RecordStore {
 
     pub(crate) fn encrypt_payload(&self, id: RecordId, payload: &[u8]) -> Result<Vec<u8>> {
         self.encrypt(id, payload)
+    }
+
+    pub(crate) fn decrypt_payload(&self, id: RecordId, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        Ok(self.keys.decrypt(ciphertext, &associated_data(id))?)
     }
 
     fn encrypt(&self, id: RecordId, payload: &[u8]) -> Result<Vec<u8>> {

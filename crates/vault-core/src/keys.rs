@@ -7,7 +7,7 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::vault::KdfParameters;
 
@@ -85,6 +85,46 @@ impl VaultKeys {
             history_key,
         };
         Ok((keys, hierarchy))
+    }
+
+    pub(crate) fn from_secret_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != KEY_SIZE * 2 {
+            return Err(KeyError::InvalidCiphertext);
+        }
+        let vault_key = bytes[..KEY_SIZE]
+            .try_into()
+            .map_err(|_| KeyError::InvalidCiphertext)?;
+        let history_key = bytes[KEY_SIZE..]
+            .try_into()
+            .map_err(|_| KeyError::InvalidCiphertext)?;
+        Ok(Self {
+            vault_key,
+            history_key,
+        })
+    }
+
+    pub(crate) fn secret_bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Zeroizing::new(Vec::with_capacity(KEY_SIZE * 2));
+        bytes.extend_from_slice(&self.vault_key);
+        bytes.extend_from_slice(&self.history_key);
+        bytes
+    }
+
+    pub(crate) fn wrap(
+        &self,
+        password: &[u8],
+        kdf: &KdfParameters,
+    ) -> Result<EncryptedKeyHierarchy> {
+        let master_key = derive_master_key(password, kdf)?;
+        Ok(EncryptedKeyHierarchy {
+            encrypted_vault_key: encrypt_with_key(&master_key, &self.vault_key, b"vault-key")?,
+            encrypted_history_key: encrypt_with_key(
+                &master_key,
+                &self.history_key,
+                b"history-key",
+            )?,
+            key_check: encrypt_with_key(&master_key, KEY_CHECK, b"key-check")?,
+        })
     }
 
     pub fn unlock(
