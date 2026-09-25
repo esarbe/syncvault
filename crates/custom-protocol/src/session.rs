@@ -34,37 +34,69 @@ where
 
     pub async fn run(mut self) -> Result<()> {
         loop {
-            self.handle_one().await?;
+            self.receive_payload().await?;
         }
     }
 
     pub async fn handle_one(&mut self) -> Result<()> {
+        self.receive_payload().await.map(|_| ())
+    }
+
+    /// Sends a typed payload and waits for the peer to acknowledge its message ID.
+    pub async fn send_payload(
+        &mut self,
+        payload_type: String,
+        payload: Vec<u8>,
+    ) -> Result<PayloadAck> {
+        let message = Message::send_payload(self.local_id, payload_type, payload)?;
+        write_frame(&mut self.stream, &Frame::new(encode(&message)?)?).await?;
+
+        let frame = read_frame(&mut self.stream, self.max_frame_size).await?;
+        let response: Message = decode(&frame)?;
+        if response.sender != self.peer_id {
+            return Err(ProtocolError::UnauthorizedPeer(response.sender.to_string()));
+        }
+        if response.message_type != MessageType::PayloadAck {
+            return Err(ProtocolError::InvalidMessage(
+                "expected a payload acknowledgement".to_string(),
+            ));
+        }
+
+        let ack: PayloadAck = decode_payload(&response)?;
+        if ack.message_id != message.id {
+            return Err(ProtocolError::InvalidMessage(
+                "acknowledgement references a different message".to_string(),
+            ));
+        }
+        Ok(ack)
+    }
+
+    /// Receives one payload, acknowledges it, and returns its decoded body.
+    pub async fn receive_payload(&mut self) -> Result<SendPayload> {
         let frame = read_frame(&mut self.stream, self.max_frame_size).await?;
         let message: Message = decode(&frame)?;
         if message.sender != self.peer_id {
             return Err(ProtocolError::UnauthorizedPeer(message.sender.to_string()));
         }
 
-        let response = match message.message_type {
+        match message.message_type {
             MessageType::SendPayload => {
-                let _: SendPayload = decode_payload(&message)?;
-                Message {
+                let payload = decode_payload(&message)?;
+                let response = Message {
                     id: uuid::Uuid::new_v4(),
                     sender: self.local_id,
                     message_type: MessageType::PayloadAck,
                     payload: encode(&PayloadAck {
                         message_id: message.id,
                     })?,
-                }
+                };
+                write_frame(&mut self.stream, &Frame::new(encode(&response)?)?).await?;
+                Ok(payload)
             }
-            MessageType::PayloadAck => {
-                return Err(ProtocolError::InvalidMessage(
-                    "a session cannot acknowledge an acknowledgement".to_string(),
-                ));
-            }
-        };
-
-        write_frame(&mut self.stream, &Frame::new(encode(&response)?)?).await
+            MessageType::PayloadAck => Err(ProtocolError::InvalidMessage(
+                "a session cannot acknowledge an acknowledgement".to_string(),
+            )),
+        }
     }
 }
 
@@ -107,5 +139,24 @@ mod tests {
         assert_eq!(response.message_type, MessageType::PayloadAck);
         let ack: PayloadAck = decode_payload(&response).unwrap();
         assert_eq!(ack.message_id, message.id);
+    }
+
+    #[tokio::test]
+    async fn sends_and_receives_payload() {
+        let (client_stream, server_stream) = duplex(4096);
+        let client_id = DeviceId::random();
+        let server_id = DeviceId::random();
+        let mut client = CustomSession::new(client_stream, server_id, client_id);
+        let mut server = CustomSession::new(server_stream, client_id, server_id);
+
+        let server_task = tokio::spawn(async move { server.receive_payload().await });
+        client
+            .send_payload("text".to_string(), b"hello".to_vec())
+            .await
+            .unwrap();
+
+        let payload = server_task.await.unwrap().unwrap();
+        assert_eq!(payload.payload_type, "text");
+        assert_eq!(payload.payload, b"hello");
     }
 }
