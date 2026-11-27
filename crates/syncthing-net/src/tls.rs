@@ -37,6 +37,11 @@ pub const CERT_FILE_NAME: &str = "cert.pem";
 /// 默认私钥文件名
 pub const KEY_FILE_NAME: &str = "key.pem";
 
+/// BEP peer-session ALPN protocol.
+pub const BEP_ALPN: &[u8] = b"bep/1.0";
+/// Relay control-session ALPN protocol.
+pub const RELAY_ALPN: &[u8] = b"bep-relay";
+
 /// Syncthing TLS配置
 #[derive(Debug)]
 pub struct SyncthingTlsConfig {
@@ -165,40 +170,53 @@ impl SyncthingTlsConfig {
 
     /// 创建服务器配置
     pub fn server_config(&self) -> std::result::Result<ServerConfig, rustls::Error> {
+        self.server_config_with_alpn(&[BEP_ALPN])
+    }
+
+    /// Create a peer TLS server configuration with the supplied ALPN protocols.
+    pub fn server_config_with_alpn(
+        &self,
+        alpn_protocols: &[&[u8]],
+    ) -> std::result::Result<ServerConfig, rustls::Error> {
         let mut config = ServerConfig::builder()
             .with_client_cert_verifier(Arc::new(SyncthingClientCertVerifier))
             .with_single_cert(self.cert_chain.clone(), self.private_key.clone_key())?;
-        config.alpn_protocols = vec![b"bep/1.0".to_vec()];
+        config.alpn_protocols = alpn_protocols
+            .iter()
+            .map(|protocol| protocol.to_vec())
+            .collect();
         Ok(config)
     }
 
     /// 创建客户端配置
     pub fn client_config(&self) -> std::result::Result<ClientConfig, rustls::Error> {
+        self.client_config_with_alpn(&[BEP_ALPN])
+    }
+
+    /// Create a peer TLS client configuration with the supplied ALPN protocols.
+    pub fn client_config_with_alpn(
+        &self,
+        alpn_protocols: &[&[u8]],
+    ) -> std::result::Result<ClientConfig, rustls::Error> {
         let mut config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SyncthingCertVerifier))
             .with_client_auth_cert(self.cert_chain.clone(), self.private_key.clone_key())?;
-        config.alpn_protocols = vec![b"bep/1.0".to_vec()];
+        config.alpn_protocols = alpn_protocols
+            .iter()
+            .map(|protocol| protocol.to_vec())
+            .collect();
         Ok(config)
     }
 
     /// Relay Protocol 服务端配置（ALPN = `bep-relay`）
     pub fn relay_server_config(&self) -> std::result::Result<ServerConfig, rustls::Error> {
-        let mut config = ServerConfig::builder()
-            .with_client_cert_verifier(Arc::new(SyncthingClientCertVerifier))
-            .with_single_cert(self.cert_chain.clone(), self.private_key.clone_key())?;
-        config.alpn_protocols = vec![b"bep-relay".to_vec()];
-        Ok(config)
+        self.server_config_with_alpn(&[RELAY_ALPN])
     }
 
     /// 获取 Relay Protocol 用的 TLS 客户端配置（ALPN = `bep-relay`）
     pub fn relay_client_config(&self) -> std::result::Result<ClientConfig, rustls::Error> {
-        let mut config = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SyncthingCertVerifier))
-            .with_client_auth_cert(self.cert_chain.clone(), self.private_key.clone_key())?;
-        config.alpn_protocols = vec![b"bep-relay".to_vec()];
-        Ok(config)
+        self.client_config_with_alpn(&[RELAY_ALPN])
     }
 
     /// 获取设备ID
@@ -499,6 +517,30 @@ where
     Ok((tls_stream, device_id))
 }
 
+/// Accept a peer TLS stream and require the selected ALPN protocol.
+pub async fn accept_tls_stream_with_alpn<S>(
+    stream: S,
+    config: &SyncthingTlsConfig,
+    expected_alpn: &[u8],
+) -> Result<(ServerTlsStream<S>, DeviceId)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ensure_crypto_provider();
+    let server_config = config
+        .server_config_with_alpn(&[expected_alpn])
+        .map_err(|e| SyncthingError::Tls(format!("failed to create server config: {}", e)))?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let tls_stream = timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+        .await
+        .map_err(|_| SyncthingError::timeout("TLS handshake timeout"))?
+        .map_err(|e| SyncthingError::Tls(format!("TLS handshake failed: {}", e)))?;
+
+    verify_selected_alpn(tls_stream.get_ref().1.alpn_protocol(), expected_alpn)?;
+    let device_id = peer_device_id_from_stream(&tls_stream)?;
+    Ok((tls_stream, device_id))
+}
+
 /// 客户端端TLS握手（泛型流，用于iroh）
 pub async fn connect_tls_stream<S>(
     stream: S,
@@ -546,6 +588,57 @@ where
     Ok((tls_stream, device_id))
 }
 
+/// Connect a peer TLS stream and require the selected ALPN protocol.
+pub async fn connect_tls_stream_with_alpn<S>(
+    stream: S,
+    config: &SyncthingTlsConfig,
+    remote_device: Option<DeviceId>,
+    expected_alpn: &[u8],
+) -> Result<(ClientTlsStream<S>, DeviceId)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ensure_crypto_provider();
+    let client_config = config
+        .client_config_with_alpn(&[expected_alpn])
+        .map_err(|e| SyncthingError::Tls(format!("failed to create client config: {}", e)))?;
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("syncthing")
+        .map_err(|_| SyncthingError::Tls("invalid server name".to_string()))?;
+    let tls_stream = timeout(
+        TLS_HANDSHAKE_TIMEOUT,
+        connector.connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| SyncthingError::timeout("TLS handshake timeout"))?
+    .map_err(|e| SyncthingError::Tls(format!("TLS handshake failed: {}", e)))?;
+
+    verify_selected_alpn(tls_stream.get_ref().1.alpn_protocol(), expected_alpn)?;
+    let device_id = peer_device_id_from_client_stream(&tls_stream)?;
+    if let Some(expected) = remote_device {
+        if expected != device_id {
+            return Err(SyncthingError::Tls(format!(
+                "device ID mismatch: expected {}, got {}",
+                expected, device_id
+            )));
+        }
+    }
+    Ok((tls_stream, device_id))
+}
+
+fn verify_selected_alpn(selected: Option<&[u8]>, expected: &[u8]) -> Result<()> {
+    if selected == Some(expected) {
+        return Ok(());
+    }
+    Err(SyncthingError::Tls(format!(
+        "unexpected TLS ALPN: expected {}, got {}",
+        String::from_utf8_lossy(expected),
+        selected
+            .map(String::from_utf8_lossy)
+            .unwrap_or_else(|| "none".into())
+    )))
+}
+
 /// 生成自签名证书和设备密钥（简化版本）
 pub fn generate_certificate(_device_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     generate_self_signed_cert()
@@ -554,6 +647,8 @@ pub fn generate_certificate(_device_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CUSTOM_ALPN: &[u8] = b"st-custom/1";
 
     #[test]
     fn test_device_id_derivation() {
@@ -589,5 +684,49 @@ mod tests {
 
         // 清理
         let _ = fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn custom_alpn_authenticates_both_devices() {
+        let (server_cert, server_key) = generate_certificate("server").unwrap();
+        let server_config = SyncthingTlsConfig::from_pem(&server_cert, &server_key).unwrap();
+        let server_id = server_config.device_id();
+        let (client_cert, client_key) = generate_certificate("client").unwrap();
+        let client_config = SyncthingTlsConfig::from_pem(&client_cert, &client_key).unwrap();
+        let client_id = client_config.device_id();
+        let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+
+        let server = tokio::spawn(async move {
+            accept_tls_stream_with_alpn(server_stream, &server_config, CUSTOM_ALPN).await
+        });
+        let (client_tls_stream, authenticated_server) = connect_tls_stream_with_alpn(
+            client_stream,
+            &client_config,
+            Some(server_id),
+            CUSTOM_ALPN,
+        )
+        .await
+        .unwrap();
+        let (_, authenticated_client) = server.await.unwrap().unwrap();
+        drop(client_tls_stream);
+
+        assert_eq!(authenticated_server, server_id);
+        assert_eq!(authenticated_client, client_id);
+    }
+
+    #[tokio::test]
+    async fn custom_alpn_rejects_bep_peer() {
+        let (cert, key) = generate_certificate("server").unwrap();
+        let server_config = SyncthingTlsConfig::from_pem(&cert, &key).unwrap();
+        let (cert, key) = generate_certificate("client").unwrap();
+        let client_config = SyncthingTlsConfig::from_pem(&cert, &key).unwrap();
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            accept_tls_stream_with_alpn(server, &server_config, CUSTOM_ALPN).await
+        });
+        assert!(connect_tls_stream(client, &client_config, None)
+            .await
+            .is_err());
+        assert!(server.await.unwrap().is_err());
     }
 }

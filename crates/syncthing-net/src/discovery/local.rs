@@ -212,10 +212,7 @@ impl LocalDiscovery {
             if iface.is_broadcast() {
                 for net in &iface.ipv4 {
                     let bcast: std::net::Ipv4Addr = net.broadcast();
-                    targets.push(SocketAddr::V4(SocketAddrV4::new(
-                        bcast,
-                        LOCAL_DISCOVERY_PORT,
-                    )));
+                    targets.push(SocketAddr::V4(SocketAddrV4::new(bcast, port)));
                 }
             }
 
@@ -334,18 +331,48 @@ impl LocalDiscovery {
         &self,
         event_tx: tokio::sync::mpsc::Sender<super::events::DiscoveryEvent>,
     ) -> Result<()> {
+        self.run_service(event_tx, true).await
+    }
+
+    /// Listen for peer announcements without advertising a local service.
+    pub async fn listen(
+        &self,
+        event_tx: tokio::sync::mpsc::Sender<super::events::DiscoveryEvent>,
+    ) -> Result<()> {
+        self.run_service(event_tx, false).await
+    }
+
+    fn bind_listener(address: SocketAddr) -> std::io::Result<UdpSocket> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(address),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        if address.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        UdpSocket::from_std(socket.into())
+    }
+
+    async fn run_service(
+        &self,
+        event_tx: tokio::sync::mpsc::Sender<super::events::DiscoveryEvent>,
+        announce: bool,
+    ) -> Result<()> {
         let broadcast_interval = tokio::time::interval(LOCAL_DISCOVERY_INTERVAL);
         tokio::pin!(broadcast_interval);
 
         // IPv4 listen socket
         let v4_bind = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let v4_socket = UdpSocket::bind(v4_bind)
-            .await
+        let v4_socket = Self::bind_listener(v4_bind)
             .map_err(|e| SyncthingError::network(format!("v4 listen bind failed: {}", e)))?;
 
         // IPv6 listen socket (optional)
         let v6_socket =
-            match UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], self.port))).await {
+            match Self::bind_listener(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], self.port))) {
                 Ok(s) => {
                     // Join the multicast group on all IPv6-capable interfaces
                     if let Err(e) = s.join_multicast_v6(&LOCAL_DISCOVERY_V6_MULTICAST, 0) {
@@ -364,7 +391,7 @@ impl LocalDiscovery {
 
         loop {
             tokio::select! {
-                _ = broadcast_interval.tick() => {
+                _ = broadcast_interval.tick(), if announce => {
                     if let Err(e) = self.broadcast().await {
                         tracing::warn!("Broadcast error: {}", e);
                     }
@@ -402,9 +429,20 @@ impl LocalDiscovery {
                     return;
                 }
                 match Announce::decode(&buf[4..len]) {
-                    Ok(announce) => {
+                    Ok(mut announce) => {
                         match DeviceId::from_bytes(&announce.id) {
                             Ok(device_id) if device_id != *self_device_id => {
+                                for value in &mut announce.addresses {
+                                    if let Some(mut address) = value
+                                        .strip_prefix("tcp://")
+                                        .and_then(|value| value.parse::<SocketAddr>().ok())
+                                    {
+                                        if address.ip().is_unspecified() {
+                                            address.set_ip(addr.ip());
+                                            *value = format!("tcp://{address}");
+                                        }
+                                    }
+                                }
                                 tracing::info!(
                                     "Local discovery: {} at {:?} (from {})",
                                     device_id,

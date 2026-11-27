@@ -260,7 +260,7 @@ impl SyncthingTcpListener {
 /// 192.168.0.0/16, fc00::/7) 在政企内网场景中是合法的。
 ///
 /// 此函数应在**不可信地址来源**（discovery、relay、外部配置）的入口处调用。
-pub(crate) fn validate_outbound_addr(addr: &SocketAddr) -> Result<()> {
+pub fn validate_outbound_addr(addr: &SocketAddr) -> Result<()> {
     let ip = addr.ip();
     if ip.is_multicast() {
         return Err(SyncthingError::config(format!(

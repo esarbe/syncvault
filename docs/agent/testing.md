@@ -41,6 +41,14 @@ timestamp: 2026-06-25T00:00:00Z
 - 新增端到端行为必须配套集成测试，禁止仅用 `#[cfg(test)]` 单元测试覆盖。
 - `test_two_node_single_file_sync` 当前因 ClusterConfig race 在并行测试负载下偶发超时，被 `#[ignore]`；生产代码已通过 reconnect 逻辑规避。
 
+### 2.2 Custom messenger
+
+`cargo test -p custom-protocol` runs the protocol tests and real CLI integration
+tests using temporary `TestNode` identities. Coverage includes direct TLS/BEP
+coexistence, trust rejection, local/global discovery, bidirectional relay
+messaging, certificate pinning, fragmented control frames, and reconnects.
+The tests use only loopback sockets and a local discovery HTTP fixture.
+
 ---
 
 ## 3. 提交前检查清单

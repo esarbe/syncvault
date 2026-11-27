@@ -209,32 +209,38 @@ pub fn resolve_session_addr(
     protocol_addr: SocketAddr,
     invitation: &SessionInvitation,
 ) -> Result<SocketAddr> {
+    let port = u16::try_from(invitation.port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| SyncthingError::network("invalid relay session port"))?;
     let addr = if invitation.address.is_empty() {
         let ip = protocol_addr.ip();
-        SocketAddr::new(ip, invitation.port as u16)
+        SocketAddr::new(ip, port)
     } else {
-        let addr_str = String::from_utf8_lossy(&invitation.address);
-        let ip: std::net::IpAddr = addr_str
-            .parse()
-            .map_err(|e| SyncthingError::network(format!("invalid session address: {}", e)))?;
-        SocketAddr::new(ip, invitation.port as u16)
+        let ip = if let Ok(ip) = String::from_utf8_lossy(&invitation.address).parse() {
+            ip
+        } else {
+            match invitation.address.as_slice() {
+                [a, b, c, d] => std::net::IpAddr::from([*a, *b, *c, *d]),
+                bytes if bytes.len() == 16 => {
+                    let mut octets = [0; 16];
+                    octets.copy_from_slice(bytes);
+                    std::net::IpAddr::from(octets)
+                }
+                _ => return Err(SyncthingError::network("invalid relay session address")),
+            }
+        };
+        SocketAddr::new(ip, port)
     };
 
-    // SAFETY: SSRF防护 — 拒绝 relay 将客户端重定向到危险地址
-    if addr.ip().is_loopback() || addr.ip().is_multicast() || addr.ip().is_unspecified() {
+    // A loopback relay may use its own IP, but cannot redirect to another loopback host.
+    if addr.ip().is_loopback() && addr.ip() != protocol_addr.ip() {
         return Err(SyncthingError::network(format!(
             "SSRF prevention: relay attempted to redirect to unsafe address {}",
             addr
         )));
     }
-    if let std::net::IpAddr::V4(v4) = addr.ip() {
-        if v4.is_link_local() {
-            return Err(SyncthingError::network(format!(
-                "SSRF prevention: relay attempted to redirect to link-local address {}",
-                addr
-            )));
-        }
-    }
+    crate::tcp_transport::validate_outbound_addr(&addr)?;
 
     Ok(addr)
 }
@@ -284,5 +290,46 @@ mod tests {
         };
         let addr = resolve_session_addr("192.168.1.1:22067".parse().unwrap(), &inv).unwrap();
         assert_eq!(addr.to_string(), "192.168.1.1:443");
+    }
+
+    #[test]
+    fn test_session_address_binary_ip_and_invalid_port() {
+        let mut invitation = SessionInvitation {
+            from: vec![],
+            key: vec![],
+            address: vec![203, 0, 113, 5],
+            port: 22068,
+            server_socket: false,
+        };
+        let relay = "192.168.1.1:22067".parse().unwrap();
+        assert_eq!(
+            resolve_session_addr(relay, &invitation)
+                .unwrap()
+                .to_string(),
+            "203.0.113.5:22068"
+        );
+        for port in [0, 65536] {
+            invitation.port = port;
+            assert!(resolve_session_addr(relay, &invitation).is_err());
+        }
+    }
+
+    #[test]
+    fn test_session_loopback_only_allowed_for_same_relay_ip() {
+        let mut invitation = SessionInvitation {
+            from: vec![],
+            key: vec![],
+            address: vec![],
+            port: 22068,
+            server_socket: false,
+        };
+        let local_relay = "127.0.0.1:22067".parse().unwrap();
+        assert!(resolve_session_addr(local_relay, &invitation).is_ok());
+        invitation.address = vec![127, 0, 0, 1];
+        assert!(resolve_session_addr("203.0.113.1:22067".parse().unwrap(), &invitation).is_err());
+        invitation.address = vec![127, 0, 0, 2];
+        assert!(resolve_session_addr(local_relay, &invitation).is_err());
+        invitation.address = "fe80::1".as_bytes().to_vec();
+        assert!(resolve_session_addr(local_relay, &invitation).is_err());
     }
 }

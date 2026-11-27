@@ -27,6 +27,24 @@ pub struct RelayProtocolClient {
 }
 
 impl RelayProtocolClient {
+    /// Connect with relay ALPN verification and optional certificate device-ID pinning.
+    pub async fn connect_authenticated(
+        addr: SocketAddr,
+        tls_config: &crate::tls::SyncthingTlsConfig,
+        relay_id: Option<DeviceId>,
+    ) -> Result<Self> {
+        crate::tcp_transport::validate_outbound_addr(&addr)?;
+        let tcp_stream = TcpStream::connect(addr).await?;
+        let (stream, _) = crate::tls::connect_tls_stream_with_alpn(
+            tcp_stream,
+            tls_config,
+            relay_id,
+            crate::tls::RELAY_ALPN,
+        )
+        .await?;
+        Ok(Self { stream })
+    }
+
     /// 以 Protocol Mode 连接 relay 服务器
     ///
     /// # 参数
@@ -59,7 +77,7 @@ impl RelayProtocolClient {
         )
         .await?;
 
-        match timeout(Duration::from_secs(30), read_message(&mut self.stream))
+        match timeout(Duration::from_secs(30), self.read_response())
             .await
             .map_err(|_| SyncthingError::network("relay join timeout"))?
         {
@@ -69,7 +87,7 @@ impl RelayProtocolClient {
             }
             Ok(Message::Response(resp)) if resp.code == 2 => {
                 warn!("Relay join already connected");
-                Ok(()) // 同设备 ID 已连接，视为成功
+                Err(SyncthingError::network("relay device already registered"))
             }
             Ok(Message::Response(resp)) => Err(SyncthingError::network(format!(
                 "relay join rejected: {} (code {})",
@@ -93,7 +111,7 @@ impl RelayProtocolClient {
         };
         write_message(&mut self.stream, &Message::ConnectRequest(req)).await?;
 
-        match timeout(Duration::from_secs(60), read_message(&mut self.stream))
+        match timeout(Duration::from_secs(60), self.read_response())
             .await
             .map_err(|_| SyncthingError::network("relay session request timeout"))?
         {
@@ -120,6 +138,17 @@ impl RelayProtocolClient {
                 other
             ))),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn read_response(&mut self) -> crate::relay::types::Result<Message> {
+        loop {
+            match read_message(&mut self.stream).await? {
+                Message::Ping(_) => {
+                    write_message(&mut self.stream, &Message::Pong(super::protocol::Pong)).await?;
+                }
+                message => return Ok(message),
+            }
         }
     }
 

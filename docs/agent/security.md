@@ -33,6 +33,20 @@ timestamp: 2026-06-25T00:00:00Z
 | `max_connections` | 1000 | `daemon_runner.rs` |
 | `connection_timeout` | 120s | `daemon_runner.rs` |
 | `MASS_DELETION_SAFETY_RATIO` | 0.5 | `index_handler.rs` |
+| Custom messenger incoming sessions | 64 (direct + relay) | `custom-protocol/src/app/mod.rs` |
+| Custom messenger peer handshake / ACK | 10s / 10s | `custom-protocol/src/app/mod.rs` |
+| Custom messenger receive idle timeout | 120s | `custom-protocol/src/app/session.rs` |
+
+The standalone messenger requires a separate certificate identity and config
+directory from the BEP daemon. Its peer ALPN is `st-custom/1`; relay control uses
+`bep-relay`. Configured non-paused peer IDs are checked against TLS certificates.
+Relay URL `?id=` pins the relay certificate when supplied.
+
+Relay session ports must be within 1..65535. Session destinations use
+`validate_outbound_addr()`; loopback is permitted only when the IP exactly
+matches the relay control connection's loopback IP, never as a redirect from
+a remote relay. This allows explicitly configured local relays without allowing
+remote relays to redirect to localhost.
 
 ---
 

@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
 use parking_lot::RwLock;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,10 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use syncthing_core::{DeviceId, Result, SyncthingError};
 
-use super::protocol::{
-    self, ConnectRequest, Header, JoinRelayRequest, JoinSessionRequest, MessageType, Ping, Pong,
-    Response, SessionInvitation,
-};
+use super::protocol::{self, ConnectRequest, Message, Ping, Pong, Response, SessionInvitation};
 
 // ── 常量 ──────────────────────────────────────────────────────
 
@@ -44,13 +41,15 @@ const SESSION_KEY_LEN: usize = 32;
 
 // ── 内部类型 ──────────────────────────────────────────────────
 
+type ProtocolWriter =
+    Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>>;
+
 /// 已注册的 relay 客户端
 #[allow(dead_code)]
 struct Client {
     device_id: DeviceId,
     /// 协议模式 TLS 连接的写入端
-    writer:
-        Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>>,
+    writer: ProtocolWriter,
     /// 待处理的连接请求
     pending_connect: HashMap<DeviceId, oneshot::Sender<()>>,
 }
@@ -58,16 +57,16 @@ struct Client {
 /// 待配对的 session
 ///
 /// 配对协议：
-/// 1. 第一个 peer 到达 → 存储其 stream + 创建 oneshot tx（供第二个 peer 发 stream 过来），等待 rx
-/// 2. 第二个 peer 到达 → 取出存储的 stream + tx，通过 tx 发自己的 stream 给第一个 peer
-/// 3. 双方各自拿到对方的 stream，开始双向转发
+/// 1. 第一个 peer 到达 → 存储其 stream，等待配对完成通知
+/// 2. 第二个 peer 到达 → 取出存储的 stream，通知第一个 peer 的等待任务
+/// 3. 第二个任务持有两个 stream，开始双向转发
 #[allow(dead_code)]
 struct PendingSession {
     from: DeviceId,
     to: DeviceId,
     key: Vec<u8>,
-    /// (第一个到达方的 stream, oneshot tx → 第二个到达方通过此 tx 发送自己的 stream)
-    first_arrived: Option<(TcpStream, oneshot::Sender<TcpStream>)>,
+    /// 第一个到达方的 stream 与配对完成通知
+    first_arrived: Option<(TcpStream, oneshot::Sender<()>)>,
 }
 
 /// Relay 服务器
@@ -76,6 +75,7 @@ pub struct RelayServer {
     listen_addr: SocketAddr,
     /// Session 模式监听地址
     session_addr: SocketAddr,
+    session_port: AtomicU16,
     /// TLS 配置
     tls_config: Arc<crate::tls::SyncthingTlsConfig>,
     /// 已注册客户端（device_id → Client）
@@ -98,6 +98,7 @@ impl RelayServer {
         Self {
             listen_addr,
             session_addr,
+            session_port: AtomicU16::new(session_addr.port()),
             tls_config,
             clients: RwLock::new(HashMap::new()),
             pending_sessions: RwLock::new(HashMap::new()),
@@ -134,6 +135,8 @@ impl RelayServer {
             .local_addr()
             .map_err(|e| SyncthingError::connection(format!("relay session local_addr: {}", e)))?;
         info!("Relay session listener on {}", actual_session_addr);
+        self.session_port
+            .store(actual_session_addr.port(), Ordering::Relaxed);
 
         let self_clients = Arc::clone(&self);
         let self_sessions = Arc::clone(&self);
@@ -257,23 +260,11 @@ impl RelayServer {
             return Err(SyncthingError::config("relay full"));
         }
 
-        {
-            let mut clients = server.clients.write();
-            clients.insert(
-                device_id,
-                Arc::new(Client {
-                    device_id,
-                    writer: Arc::clone(&writer),
-                    pending_connect: HashMap::new(),
-                }),
-            );
-        }
-        info!(device = %device_id.short_id(), "Client registered (total: {})", server.clients.read().len());
-
-        // 标记离开时清理
+        // Only JoinRelay registers a listener; transient dialers must not replace it.
         let _guard = ClientGuard {
             server: Arc::clone(server),
             device_id,
+            writer: Arc::clone(&writer),
         };
 
         // 启动 Ping 定时器
@@ -289,7 +280,7 @@ impl RelayServer {
                     Ok(Ok(_)) => trace!(device = %ping_device.short_id(), "Ping sent"),
                     _ => {
                         debug!(device = %ping_device.short_id(), "Ping failed, client gone");
-                        ping_server.remove_client(&ping_device);
+                        ping_server.remove_client(&ping_device, &ping_writer);
                         break;
                     }
                 }
@@ -297,79 +288,81 @@ impl RelayServer {
         });
 
         // 读取循环 — 处理 Protocol Mode 消息
-        let mut buf = vec![0u8; 65536];
         loop {
-            let n = match timeout(PROTOCOL_TIMEOUT, read_half.read(&mut buf)).await {
-                Ok(Ok(0)) => {
-                    debug!(device = %device_id.short_id(), "Protocol client disconnected");
-                    break;
-                }
-                Ok(Ok(n)) => n,
+            let message = match timeout(
+                PING_INTERVAL * 2 + PING_TIMEOUT,
+                protocol::read_message(&mut read_half),
+            )
+            .await
+            {
+                Ok(Ok(message)) => message,
                 Ok(Err(e)) => {
                     warn!(device = %device_id.short_id(), error = %e, "Protocol read error");
                     break;
                 }
                 Err(_) => {
-                    trace!(device = %device_id.short_id(), "Protocol read timeout");
-                    continue;
+                    warn!(device = %device_id.short_id(), "Protocol read timeout");
+                    break;
                 }
             };
 
-            let mut data = Bytes::from(buf[..n].to_vec());
-            while data.remaining() >= Header::SIZE {
-                let header = match Header::decode(&mut data) {
-                    Some(h) => h,
-                    None => break,
-                };
-                if header.magic != protocol::MAGIC {
-                    warn!("Bad magic from {}", device_id.short_id());
-                    break;
+            match message {
+                Message::Ping(_) => {
+                    trace!(device = %device_id.short_id(), "Ping received");
+                    let pong = Pong.encode();
+                    let mut w = writer.lock().await;
+                    let _ = timeout(PROTOCOL_TIMEOUT, w.write_all(&pong)).await;
                 }
-                let body_len = header.message_length.max(0) as usize;
-                if data.remaining() < body_len {
-                    break; // 等待更多数据
+                Message::Pong(_) => {
+                    trace!(device = %device_id.short_id(), "Pong received");
                 }
-                let body = data.split_to(body_len);
-                let mut body_buf = body;
-
-                match header.message_type {
-                    MessageType::Ping => {
-                        trace!(device = %device_id.short_id(), "Ping received");
-                        let pong = Pong.encode();
-                        let mut w = writer.lock().await;
-                        let _ = timeout(PROTOCOL_TIMEOUT, w.write_all(&pong)).await;
-                    }
-                    MessageType::Pong => {
-                        trace!(device = %device_id.short_id(), "Pong received");
-                    }
-                    MessageType::JoinRelayRequest => {
-                        let _req = JoinRelayRequest; // 已在上方注册，回复成功
-                        let resp = Response::success().encode();
-                        let mut w = writer.lock().await;
-                        let _ = timeout(PROTOCOL_TIMEOUT, w.write_all(&resp)).await;
-                        debug!(device = %device_id.short_id(), "JoinRelay accepted");
-                    }
-                    MessageType::ConnectRequest => {
-                        if let Some(req) = ConnectRequest::decode(&mut body_buf) {
-                            Self::handle_connect_request(server, device_id, &req, &writer).await;
+                Message::JoinRelayRequest(_) => {
+                    let response = {
+                        let mut clients = server.clients.write();
+                        if clients.contains_key(&device_id) {
+                            Response {
+                                code: 2,
+                                message: "device already registered".to_string(),
+                            }
+                        } else if clients.len() >= MAX_CLIENTS {
+                            Response {
+                                code: 1,
+                                message: "relay full".to_string(),
+                            }
+                        } else {
+                            clients.insert(
+                                device_id,
+                                Arc::new(Client {
+                                    device_id,
+                                    writer: Arc::clone(&writer),
+                                    pending_connect: HashMap::new(),
+                                }),
+                            );
+                            Response::success()
                         }
-                    }
-                    MessageType::Response => {
-                        // 客户端不应该发 Response
-                        trace!("Unexpected Response from client");
-                    }
-                    MessageType::SessionInvitation => {
-                        // 客户端不应该发 SessionInvitation
-                        trace!("Unexpected SessionInvitation from client");
-                    }
-                    MessageType::JoinSessionRequest | MessageType::RelayFull => {
-                        // 这些消息只应在 Session Mode 出现
-                        warn!(
-                            device = %device_id.short_id(),
-                            msg_type = ?header.message_type,
-                            "Unexpected message type in protocol mode"
-                        );
-                    }
+                    };
+                    let resp = response.encode();
+                    let mut w = writer.lock().await;
+                    let _ = timeout(PROTOCOL_TIMEOUT, w.write_all(&resp)).await;
+                    debug!(device = %device_id.short_id(), "JoinRelay accepted");
+                }
+                Message::ConnectRequest(req) => {
+                    Self::handle_connect_request(server, device_id, &req, &writer).await;
+                }
+                Message::Response(_) => {
+                    // 客户端不应该发 Response
+                    trace!("Unexpected Response from client");
+                }
+                Message::SessionInvitation(_) => {
+                    // 客户端不应该发 SessionInvitation
+                    trace!("Unexpected SessionInvitation from client");
+                }
+                Message::JoinSessionRequest(_) | Message::RelayFull(_) => {
+                    // 这些消息只应在 Session Mode 出现
+                    warn!(
+                        device = %device_id.short_id(),
+                        "Unexpected message type in protocol mode"
+                    );
                 }
             }
         }
@@ -384,9 +377,7 @@ impl RelayServer {
         server: &Arc<RelayServer>,
         from_device: DeviceId,
         req: &ConnectRequest,
-        writer: &Arc<
-            tokio::sync::Mutex<tokio::io::WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>>,
-        >,
+        writer: &ProtocolWriter,
     ) {
         let target_id = match DeviceId::from_bytes(&req.id) {
             Ok(id) => id,
@@ -444,12 +435,12 @@ impl RelayServer {
             );
         }
 
-        // 向发起方发送 SessionInvitation（server_socket=true 连接后由发起方决定角色）
+        // 发起方使用 TLS client，目标方使用 TLS server。
         let inv_from = SessionInvitation {
-            from: from_device.as_bytes().to_vec(),
+            from: target_id.as_bytes().to_vec(),
             key: key.clone(),
             address: vec![], // 空 = 使用同一 relay IP 的 session 端口
-            port: 0,         // 将由客户端的 resolve_session_addr 处理
+            port: u32::from(server.session_port.load(Ordering::Relaxed)),
             server_socket: false,
         };
         {
@@ -462,7 +453,7 @@ impl RelayServer {
             from: from_device.as_bytes().to_vec(),
             key,
             address: vec![],
-            port: 0,
+            port: u32::from(server.session_port.load(Ordering::Relaxed)),
             server_socket: true,
         };
         {
@@ -477,10 +468,15 @@ impl RelayServer {
         );
     }
 
-    fn remove_client(&self, device_id: &DeviceId) {
+    fn remove_client(&self, device_id: &DeviceId, writer: &ProtocolWriter) {
         let mut clients = self.clients.write();
-        clients.remove(device_id);
-        info!(device = %device_id.short_id(), "Client removed (total: {})", clients.len());
+        if clients
+            .get(device_id)
+            .is_some_and(|client| Arc::ptr_eq(&client.writer, writer))
+        {
+            clients.remove(device_id);
+            info!(device = %device_id.short_id(), "Client removed (total: {})", clients.len());
+        }
     }
 }
 
@@ -490,52 +486,31 @@ impl RelayServer {
     /// 处理 session 模式连接 — 两阶段配对
     ///
     /// Phase 1（第一个到达方）：
-    ///   存储 stream + 创建 oneshot tx，等待第二个到达方通过 tx 发来 stream
+    ///   存储 stream + 创建 oneshot tx，等待配对完成通知
     /// Phase 2（第二个到达方）：
-    ///   取出存储的 stream + tx，通过 tx 发送自己的 stream，获取第一个 stream
+    ///   取出存储的 stream + tx，通知配对完成并开始转发
     async fn handle_session_connection(
         server: &Arc<RelayServer>,
         mut stream: TcpStream,
         peer_addr: SocketAddr,
     ) -> Result<()> {
-        // 读取 JoinSessionRequest
-        let mut read_buf = vec![0u8; 8192];
-        let n = timeout(SESSION_TIMEOUT, stream.read(&mut read_buf))
+        let message = timeout(SESSION_TIMEOUT, protocol::read_message(&mut stream))
             .await
             .map_err(|_| SyncthingError::timeout("session read timeout"))?
-            .map_err(SyncthingError::Io)?;
-        if n == 0 {
-            return Ok(());
-        }
-        read_buf.truncate(n);
-
-        let mut data = Bytes::from(read_buf);
-        let header = Header::decode(&mut data)
-            .ok_or_else(|| SyncthingError::protocol("invalid session header"))?;
-        if header.magic != protocol::MAGIC || header.message_type != MessageType::JoinSessionRequest
-        {
+            .map_err(|error| SyncthingError::protocol(error.to_string()))?;
+        let Message::JoinSessionRequest(join_req) = message else {
             return Err(SyncthingError::protocol(
                 "expected JoinSessionRequest in session mode",
             ));
-        }
-
-        let body_len = header.message_length.max(0) as usize;
-        let body = if data.remaining() >= body_len {
-            data.split_to(body_len)
-        } else {
-            data
         };
-        let mut body_buf = body;
-        let join_req = JoinSessionRequest::decode(&mut body_buf)
-            .ok_or_else(|| SyncthingError::protocol("invalid JoinSessionRequest"))?;
 
         let key = join_req.key;
         debug!(peer = %peer_addr, key_len = key.len(), "Session join request");
 
         // 两阶段配对：在锁内决定角色，锁外执行 I/O
         enum SessionRole {
-            Phase1(oneshot::Receiver<TcpStream>),
-            Phase2(TcpStream, TcpStream), // (first_stream, my_stream)
+            Phase1(oneshot::Receiver<()>),
+            Phase2(TcpStream, TcpStream, oneshot::Sender<()>),
         }
 
         let role = {
@@ -548,12 +523,12 @@ impl RelayServer {
                 }
             };
 
-            if let Some((first_stream, _tx_to_first)) = session.first_arrived.take() {
+            if let Some((first_stream, tx_to_first)) = session.first_arrived.take() {
                 // Phase 2: 拥有双方 stream
-                SessionRole::Phase2(first_stream, stream)
+                SessionRole::Phase2(first_stream, stream, tx_to_first)
             } else {
                 // Phase 1: 存储自己的 stream，等待 Phase 2
-                let (tx, rx) = oneshot::channel::<TcpStream>();
+                let (tx, rx) = oneshot::channel();
                 session.first_arrived = Some((stream, tx));
                 SessionRole::Phase1(rx)
             }
@@ -563,7 +538,7 @@ impl RelayServer {
             SessionRole::Phase1(rx) => {
                 debug!("First session peer — stored stream, waiting for second");
                 match timeout(SESSION_TIMEOUT, rx).await {
-                    Ok(Ok(_s)) => {
+                    Ok(Ok(())) => {
                         debug!("First peer notified of pairing completion");
                         Ok(())
                     }
@@ -575,7 +550,10 @@ impl RelayServer {
                     }
                 }
             }
-            SessionRole::Phase2(mut first_stream, mut my_stream) => {
+            SessionRole::Phase2(mut first_stream, mut my_stream, paired) => {
+                paired
+                    .send(())
+                    .map_err(|_| SyncthingError::timeout("first session peer stopped waiting"))?;
                 let resp = Response::success().encode();
                 timeout(SESSION_TIMEOUT, first_stream.write_all(&resp))
                     .await
@@ -649,11 +627,12 @@ impl RelayServer {
 struct ClientGuard {
     server: Arc<RelayServer>,
     device_id: DeviceId,
+    writer: ProtocolWriter,
 }
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
-        self.server.remove_client(&self.device_id);
+        self.server.remove_client(&self.device_id, &self.writer);
     }
 }
 

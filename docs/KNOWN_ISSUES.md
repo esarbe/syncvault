@@ -798,3 +798,26 @@ v0.2.8 完成首次双节点真实网络环境下的完整文件同步验证。
 **恢复路径**：手机（HONOR）事故期间离线，未接收删除，为最佳恢复源；云端实体文件可能仍在。
 
 **残留事项**：回收站无自动恢复 UI（人工/SOP 恢复）；建议重要文件夹启用 versioning。
+
+---
+
+## §23. Relay messenger session establishment and registration lifecycle (fixed, 2026-11-27)
+
+**Symptoms**: the bundled relay advertised session port 0, preventing session
+connections. After correcting the port, a device sending while its listener was
+registered lost that registration, causing the reply to fail with "peer not found".
+Control/session parsers also assumed complete frames arrived in a single TCP read.
+
+**Fixes**:
+- Advertise the actual bound session port and the destination ID to the dialer.
+- Register persistent clients only on `JoinRelayRequest`; transient dialers cannot
+  replace or remove them. Cleanup checks the registration's connection identity.
+- Read complete frames with the existing relay I/O helper, handle heartbeat Pings
+  during client registration/session requests, and notify session pairing correctly.
+- Validate session ports and IP addresses, including binary IPv4/IPv6 invitations.
+  Loopback session destinations require the same loopback IP as the control relay.
+
+**Regression coverage**: `crates/custom-protocol/tests/messenger.rs` runs two
+`TestNode` identities with simultaneous CLI listeners and bidirectional sends
+through the real relay, plus fragmented control-frame and reconnect checks.
+Shared session-address and ALPN checks live in `syncthing-net` tests.

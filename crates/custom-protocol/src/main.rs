@@ -1,98 +1,61 @@
+mod app;
+
 use std::env;
-use std::error::Error;
-use std::io;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
-use custom_protocol::{negotiate_client, negotiate_server, CustomConnection, ProtocolError};
+use anyhow::{bail, Result};
+use app::config::{load_identity, RuntimeConfig};
 use syncthing_core::DeviceId;
-use tokio::net::{TcpListener, TcpStream};
-
-type MainResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 #[tokio::main]
-async fn main() -> MainResult {
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let arguments: Vec<String> = env::args().collect();
     match arguments.get(1).map(String::as_str) {
-        Some("id") if arguments.len() == 2 => {
-            println!("{}", DeviceId::random());
+        Some("id") if arguments.len() == 4 && arguments[2] == "--config-dir" => {
+            let identity = load_identity(Path::new(&arguments[3])).await?;
+            println!("{}", identity.device_id());
             Ok(())
         }
-        Some("listen") if arguments.len() == 4 => {
-            let local_id = parse_device_id(&arguments[3])?;
-            listen(&arguments[2], local_id).await
+        Some("listen") => listen_command(&arguments).await,
+        Some("send") if arguments.len() >= 6 && arguments[2] == "--config-dir" => {
+            let runtime = RuntimeConfig::load(Path::new(&arguments[3])).await?;
+            let peer_id = DeviceId::from_str(&arguments[4])?;
+            app::direct::send(&runtime, peer_id, arguments[5..].join(" ")).await
         }
-        Some("send") if arguments.len() >= 6 => {
-            let local_id = parse_device_id(&arguments[3])?;
-            let peer_id = parse_device_id(&arguments[4])?;
-            send(&arguments[2], local_id, peer_id, arguments[5..].join(" ")).await
-        }
-        _ => Err(usage().into()),
+        _ => bail!(usage()),
     }
 }
 
-async fn listen(address: &str, local_id: DeviceId) -> MainResult {
-    let listener = TcpListener::bind(address).await?;
-    println!("listening on {address} as {local_id}");
-
-    loop {
-        let (stream, remote_address) = listener.accept().await?;
-        tokio::spawn(async move {
-            if let Err(error) = receive_messages(stream, local_id).await {
-                eprintln!("connection from {remote_address} ended: {error}");
-            }
-        });
+async fn listen_command(arguments: &[String]) -> Result<()> {
+    if arguments.len() != 4 && arguments.len() != 6 {
+        bail!(usage());
     }
-}
+    if arguments[2] != "--config-dir" {
+        bail!(usage());
+    }
 
-async fn receive_messages(mut stream: TcpStream, local_id: DeviceId) -> MainResult {
-    let hello = negotiate_server(&mut stream, local_id, None, vec!["text".to_string()]).await?;
-    let peer_id = hello.device_id;
-    let mut session = CustomConnection::new(stream, peer_id).into_session(local_id);
-
-    loop {
-        match session.receive_payload().await {
-            Ok(payload) if payload.payload_type == "text" => {
-                let text = String::from_utf8(payload.payload)?;
-                println!("[{peer_id}] {text}");
-            }
-            Ok(payload) => {
-                eprintln!("[{peer_id}] ignored payload type {}", payload.payload_type);
-            }
-            Err(ProtocolError::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
+    let config_dir = PathBuf::from(&arguments[3]);
+    let runtime = RuntimeConfig::load(&config_dir).await?;
+    let bind_address = if arguments.len() == 6 {
+        if arguments[4] != "--bind" {
+            bail!(usage());
         }
-    }
-}
-
-async fn send(address: &str, local_id: DeviceId, peer_id: DeviceId, text: String) -> MainResult {
-    let mut stream = TcpStream::connect(address).await?;
-    negotiate_client(
-        &mut stream,
-        local_id,
-        Some(peer_id),
-        vec!["text".to_string()],
-    )
-    .await?;
-
-    let mut session = CustomConnection::new(stream, peer_id).into_session(local_id);
-    session
-        .send_payload("text".to_string(), text.into_bytes())
-        .await?;
-    println!("message acknowledged by {peer_id}");
-    Ok(())
-}
-
-fn parse_device_id(value: &str) -> MainResult<DeviceId> {
-    Ok(DeviceId::from_str(value)?)
+        arguments[5].clone()
+    } else {
+        runtime.config.listen_addr.clone()
+    };
+    app::direct::listen(Arc::new(runtime), &bind_address).await
 }
 
 fn usage() -> &'static str {
-    "usage:\n  custom-protocol id\n  custom-protocol listen <address> <local-device-id>\n  custom-protocol send <address> <local-device-id> <peer-device-id> <text>"
+    "usage:\n  custom-protocol id --config-dir <dir>\n  custom-protocol listen --config-dir <dir> [--bind <address>]\n  custom-protocol send --config-dir <dir> <peer-device-id> <text>"
 }

@@ -27,6 +27,7 @@ timestamp: 2026-06-25T00:00:00Z
 | `syncthing-versioner` | 文件版本归档策略 | 禁止 FS I/O |
 | `syncthing-test-utils` | 测试辅助（`MemoryPipe`、`TestNode`） | 仅用于测试 / 开发工具 |
 | `obsidian-vault-crypto-adapter` | Obsidian Vault 加密适配（E2E 测试用） | 禁止进入生产二进制；仅作 dev-dependency |
+| `custom-protocol` | 独立实验消息协议及 messenger CLI | 禁止接入生产文件同步路径；应用层复用 `syncthing-net` 的 TLS / discovery / relay，ALPN 为 `st-custom/1`，不发送 BEP |
 
 ### 1.1 分层耦合红线
 
